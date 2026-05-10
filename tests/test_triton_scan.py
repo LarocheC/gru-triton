@@ -13,7 +13,7 @@ triton = pytest.importorskip("triton")
 
 from gru_qat.gru_layer import GRULayer
 from gru_qat.quantizers import QuantizerConfig, QuantRecipe
-from gru_qat.triton_kernels.scan import gru_scan_forward
+from gru_qat.triton_kernels.scan import gru_scan, gru_scan_forward
 
 cuda_only = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
@@ -62,3 +62,55 @@ def test_triton_forward_matches_pytorch(T: int, B: int, IN: int, H: int) -> None
     # TF32 input precision in tl.dot — ~10-bit mantissa per matmul.
     # Drift accumulates across 3 matmuls per step + T steps + nonlinearities.
     assert max_diff < 5e-3, f"max diff {max_diff} exceeds 5e-3"
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,IN,H", [(7, 4, 8, 16), (16, 8, 16, 32)])
+def test_triton_backward_matches_pytorch(T: int, B: int, IN: int, H: int) -> None:
+    """Gradients from the autograd Function (Triton fwd + PyTorch bwd) must
+    match gradients from running the equivalent reference path through
+    PyTorch autograd, for the same scalar loss."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+
+    # Build a reference layer to materialize Wh_cat/bh_cat with matching init.
+    ref_layer = _ref_layer(IN, H).to(device)
+
+    x = torch.randn(T, B, IN, device=device, requires_grad=True)
+    h0 = torch.randn(B, H, device=device, requires_grad=True)
+
+    # Reference path: PyTorch autograd through the layer
+    ref_x = x.detach().clone().requires_grad_()
+    ref_h0 = h0.detach().clone().requires_grad_()
+    ref_out, _ = ref_layer(ref_x, ref_h0)
+    ref_loss = ref_out.float().pow(2).sum()
+    ref_loss.backward()
+
+    # Triton path: pre-batch input projection, run gru_scan, backward
+    # We need to backprop through the input projection too, so we don't use
+    # cell.input_projection (no_grad in eval). Build it explicitly.
+    w = ref_layer.cell.quantize_weights()
+    Wi_cat = w.Wi_cat.detach().clone()
+    bi_cat = w.bi_cat.detach().clone()
+    Wh_cat = w.Wh_cat.detach().clone().requires_grad_()
+    bh_cat = w.bh_cat.detach().clone().requires_grad_()
+
+    tri_x = x.detach().clone().requires_grad_()
+    tri_h0 = h0.detach().clone().requires_grad_()
+    gi = torch.nn.functional.linear(tri_x, Wi_cat, bi_cat)  # [T, B, 3H]
+    out = gru_scan(gi, tri_h0, Wh_cat, bh_cat)
+    loss = out.float().pow(2).sum()
+    loss.backward()
+
+    # Compare scalar loss (forward parity already tested elsewhere).
+    assert abs(loss.item() - ref_loss.item()) / max(abs(ref_loss.item()), 1.0) < 1e-2
+
+    # Compare gradients on x and h0.
+    for name, ref_g, tri_g in [
+        ("x", ref_x.grad, tri_x.grad),
+        ("h0", ref_h0.grad, tri_h0.grad),
+    ]:
+        assert ref_g is not None and tri_g is not None
+        max_diff = (ref_g - tri_g).abs().max().item()
+        rel = max_diff / max(ref_g.abs().max().item(), 1e-6)
+        assert rel < 5e-2, f"{name} grad rel diff {rel:.4f} exceeds 5e-2"

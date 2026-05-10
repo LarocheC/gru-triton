@@ -169,6 +169,119 @@ def gru_scan_fwd_kernel(
         sh_b = so_b
 
 
+def _gru_scan_backward_pytorch(
+    gi: torch.Tensor,
+    h0: torch.Tensor,
+    Wh_cat: torch.Tensor,
+    bh_cat: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference backward for the multi-step scan, in PyTorch.
+
+    Walks t from T-1 down to 0 and computes gradients w.r.t. the four
+    forward inputs. Recomputes ``r``, ``z``, ``n``, ``gh_n`` from
+    ``h_{t-1}`` and the saved ``out`` rather than saving them — keeps the
+    save-tensor footprint to ``[T, B, H]`` (out) plus the original inputs.
+    Recompute is cheap relative to the autograd traversal saved.
+
+    Slow: pure PyTorch per-step. Used as the gradient-correctness ground
+    truth and as a fallback when a Triton backward isn't yet wired up.
+    """
+    T, B, _ = gi.shape
+    H = h0.shape[-1]
+
+    dgi = torch.zeros_like(gi)
+    dWh = torch.zeros_like(Wh_cat)
+    dbh = torch.zeros_like(bh_cat)
+
+    dh_acc = torch.zeros_like(h0)
+
+    for t in reversed(range(T)):
+        h_prev = h0 if t == 0 else out[t - 1]
+
+        gi_r, gi_z, gi_n = gi[t].chunk(3, dim=-1)
+        gh = h_prev @ Wh_cat.T + bh_cat
+        gh_r, gh_z, gh_n = gh.chunk(3, dim=-1)
+        r = torch.sigmoid(gi_r + gh_r)
+        z = torch.sigmoid(gi_z + gh_z)
+        n = torch.tanh(gi_n + r * gh_n)
+
+        dh_t = dout[t] + dh_acc
+
+        # h_t = (1 - z) * n + z * h_prev
+        dn = dh_t * (1.0 - z)
+        dz = dh_t * (h_prev - n)
+        dh_prev_direct = dh_t * z
+
+        # n = tanh(gn_pre)
+        dgn_pre = dn * (1.0 - n * n)
+
+        # gn_pre = gi_n + r * gh_n
+        dgi_n = dgn_pre
+        dr = dgn_pre * gh_n
+        dgh_n = dgn_pre * r
+
+        # z = sigmoid(gi_z + gh_z)
+        dgz_pre = dz * z * (1.0 - z)
+        dgi_z = dgz_pre
+        dgh_z = dgz_pre
+
+        # r = sigmoid(gi_r + gh_r)
+        dgr_pre = dr * r * (1.0 - r)
+        dgi_r = dgr_pre
+        dgh_r = dgr_pre
+
+        dgi[t] = torch.cat([dgi_r, dgi_z, dgi_n], dim=-1)
+        dgh = torch.cat([dgh_r, dgh_z, dgh_n], dim=-1)
+
+        # gh = h_prev @ Wh_cat^T + bh_cat
+        dh_prev_via_W = dgh @ Wh_cat
+        dWh += dgh.transpose(0, 1) @ h_prev
+        dbh += dgh.sum(dim=0)
+
+        dh_acc = dh_prev_direct + dh_prev_via_W
+
+    return dgi, dh_acc, dWh, dbh
+
+
+class GRUScanFunction(torch.autograd.Function):
+    """autograd wrapper: Triton forward, PyTorch reference backward.
+
+    Once the Triton backward kernel is written, swap the backward body to
+    call it; the forward and the autograd plumbing don't change.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        gi: torch.Tensor,
+        h0: torch.Tensor,
+        Wh_cat: torch.Tensor,
+        bh_cat: torch.Tensor,
+    ) -> torch.Tensor:
+        out = gru_scan_forward(gi, h0, Wh_cat, bh_cat)
+        ctx.save_for_backward(gi, h0, Wh_cat, bh_cat, out)
+        return out
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx, dout: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
+        return _gru_scan_backward_pytorch(gi, h0, Wh_cat, bh_cat, out, dout)
+
+
+def gru_scan(
+    gi: torch.Tensor,
+    h0: torch.Tensor,
+    Wh_cat: torch.Tensor,
+    bh_cat: torch.Tensor,
+) -> torch.Tensor:
+    """Public API: differentiable multi-step GRU scan."""
+    return GRUScanFunction.apply(gi, h0, Wh_cat, bh_cat)
+
+
 def gru_scan_forward(
     gi: torch.Tensor,
     h0: torch.Tensor,
