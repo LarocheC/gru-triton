@@ -1,9 +1,4 @@
-"""Train-step bench: Triton scan (hybrid backward) vs the PyTorch best path.
-
-The Triton kernel currently has a Triton forward and a PyTorch reference
-backward. This bench tells us how much of train-step time is forward —
-i.e. how much we'd gain from also writing a Triton backward kernel.
-"""
+"""Train-step bench: Triton scan (forward + backward) vs the PyTorch best path."""
 
 from __future__ import annotations
 
@@ -120,7 +115,7 @@ def main() -> None:
         for name, ms in [
             ("cudnn_gru_fp32", ms_cudnn),
             ("ours_fp32_fused_prebatch_compiled", ms_compiled),
-            ("triton_scan_fwd + pytorch_bwd", ms_triton),
+            ("triton_scan (fwd + bwd)", ms_triton),
         ]:
             ratio = f"{ms / ms_cudnn:5.2f}x"
             print(f"{name:40s} {shape_fmt:22s} {ms:10.3f}  {ratio:>10s}")
