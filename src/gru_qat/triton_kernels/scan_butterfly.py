@@ -165,9 +165,17 @@ def gru_scan_butterfly_fwd_kernel(
     st_g, st_s, st_p, st_m_new, st_m_old,
     so_t, so_b,
     sscr_pid, sscr_buf, sscr_b,
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     H: tl.constexpr,
     LOG_H: tl.constexpr,
     BLOCK_B: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     """Persistent forward over the butterfly recurrence.
 
@@ -196,16 +204,24 @@ def gru_scan_butterfly_fwd_kernel(
 
     for t in range(T):
         # Stage 0 of butterfly: copy h_in into all three gate scratch
-        # buffers (we'll mutate them in place across stages).
+        # buffers (we'll mutate them in place across stages). Apply
+        # quant_h_in to the matmul-side h; the direct contribution
+        # `(1-z)*n + z*h_self` below uses the raw h_self.
         h_self = tl.load(
             h_in_ptr + offs_b[:, None] * sh_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         )
+        if QUANT_H_IN:
+            q = tl.extra.libdevice.rint(h_self / h_in_scale)
+            q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+            h_self_q = q * h_in_scale
+        else:
+            h_self_q = h_self
         for g in range(3):
             scr_g = scr_base + g * sscr_buf
             tl.store(
                 scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
-                h_self,
+                h_self_q,
                 mask=mask_b[:, None],
             )
 
@@ -283,6 +299,11 @@ def gru_scan_butterfly_fwd_kernel(
         n = tl.extra.libdevice.tanh(gin + r * gh_n)
         h_new = (1.0 - z) * n + z * h_self
 
+        if QUANT_H_OUT:
+            q = tl.extra.libdevice.rint(h_new / h_out_scale)
+            q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
+            h_new = q * h_out_scale
+
         out_ptrs = (
             out_ptr + t * so_t + offs_b[:, None] * so_b + offs_h[None, :]
         )
@@ -302,6 +323,8 @@ def gru_scan_butterfly_forward_triton(
     block_b: int = 8,
     num_warps: int = 4,
     num_stages: int = 1,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Multi-step persistent Triton butterfly forward.
 
@@ -340,6 +363,9 @@ def gru_scan_butterfly_forward_triton(
         (n_pid_b, 4, block_b, H), device=gi.device, dtype=gi.dtype,
     )
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     grid = (n_pid_b,)
     gru_scan_butterfly_fwd_kernel[grid](
         gi, h0, twiddles, bh_cat, out, scratch,
@@ -350,9 +376,13 @@ def gru_scan_butterfly_forward_triton(
         twiddles.stride(3), twiddles.stride(4),
         out.stride(0), out.stride(1),
         scratch.stride(0), scratch.stride(1), scratch.stride(2),
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H,
         LOG_H=log_H,
         BLOCK_B=block_b,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -390,9 +420,17 @@ def gru_scan_butterfly_bwd_kernel(
     sdbp_pid,
     sst_pid, sst_g, sst_l, sst_b,
     sdh_b,
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     H: tl.constexpr,
     LOG_H: tl.constexpr,
     BLOCK_B: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     """Persistent backward over the butterfly recurrence.
 
@@ -444,13 +482,20 @@ def gru_scan_butterfly_bwd_kernel(
         )
 
         # ---- Recompute butterfly forward, saving per-stage states ----
-        # state[g, 0] = h_prev (shared across gates, but stored per-gate
-        # to keep indexing uniform).
+        # state[g, 0] = quant_h_in(h_prev). Matches the forward kernel:
+        # the matmul side starts from the QUANTIZED h_prev. The raw
+        # h_prev is used below for the (1-z)*n + z*h_prev recurrence.
+        if QUANT_H_IN:
+            q = tl.extra.libdevice.rint(h_prev / h_in_scale)
+            q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+            h_prev_q = q * h_in_scale
+        else:
+            h_prev_q = h_prev
         for g in range(3):
             base_g = state_base + g * sst_g + 0 * sst_l
             tl.store(
                 base_g + offs_b[:, None] * sst_b + offs_h[None, :],
-                h_prev,
+                h_prev_q,
                 mask=mask_b[:, None],
             )
         # Run stages, saving each output.
@@ -520,6 +565,15 @@ def gru_scan_butterfly_bwd_kernel(
             mask=mask_b[:, None], other=0.0,
         )
         dh_t = dout_oh + dh_acc_oh
+
+        # STE backward of quant_h_out: incoming dh_t is grad on the
+        # quantized h_t (= post-quant_h_out). Multiply by clip mask of
+        # h_t_raw to get grad on h_t_raw before walking the recurrence.
+        if QUANT_H_OUT:
+            h_t_raw = (1.0 - z) * n + z * h_prev
+            q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+            mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
+            dh_t = tl.where(mask_out, dh_t, 0.0)
 
         dn = dh_t * (1.0 - z)
         dz = dh_t * (h_prev - n)
@@ -734,8 +788,10 @@ def gru_scan_butterfly_bwd_kernel(
                 tl.atomic_add(dt_base + 0 * sdtp_m_old, contrib_to_m0)
                 tl.atomic_add(dt_base + 1 * sdtp_m_old, contrib_to_m1)
 
-        # After all stages backward, state[g, 0] holds d_h_prev for gate g.
-        # Sum across gates and add dh_prev_direct.
+        # After all stages backward, state[g, 0] holds d_h_prev_q for
+        # gate g (gradient on the QUANTIZED h_prev — the matmul-side
+        # input). Sum across gates, then apply STE backward of
+        # quant_h_in (zero where h_prev was clipped).
         dh_via_r = tl.load(
             state_base + 0 * sst_g + 0 * sst_l + offs_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
@@ -748,7 +804,12 @@ def gru_scan_butterfly_bwd_kernel(
             state_base + 2 * sst_g + 0 * sst_l + offs_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         )
-        dh_acc_new = dh_prev_direct + dh_via_r + dh_via_z + dh_via_n
+        dh_via = dh_via_r + dh_via_z + dh_via_n
+        if QUANT_H_IN:
+            q_in_unclamped = tl.extra.libdevice.rint(h_prev / h_in_scale)
+            mask_in = (q_in_unclamped >= h_in_qmin) & (q_in_unclamped <= h_in_qmax)
+            dh_via = tl.where(mask_in, dh_via, 0.0)
+        dh_acc_new = dh_prev_direct + dh_via
 
         tl.store(
             dh_acc_ptr + offs_b[:, None] * sdh_b + offs_h[None, :],
@@ -779,6 +840,8 @@ def gru_scan_butterfly_backward_triton(
     block_b: int = 8,
     num_warps: int = 4,
     num_stages: int = 1,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Multi-step persistent Triton butterfly backward.
 
@@ -817,6 +880,9 @@ def gru_scan_butterfly_backward_triton(
     )
     dh_acc = torch.empty((B, H), device=gi.device, dtype=gi.dtype)
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     grid = (n_pid_b,)
     gru_scan_butterfly_bwd_kernel[grid](
         gi, h0, twiddles, bh_cat, out,
@@ -839,7 +905,11 @@ def gru_scan_butterfly_backward_triton(
         dbh_partial.stride(0),
         state.stride(0), state.stride(1), state.stride(2), state.stride(3),
         dh_acc.stride(0),
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H, LOG_H=log_H, BLOCK_B=block_b,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps, num_stages=num_stages,
     )
 
@@ -850,8 +920,8 @@ def gru_scan_butterfly_backward_triton(
 
 class GRUScanButterflyTritonFunction(torch.autograd.Function):
     """autograd wrapper around the multi-step persistent Triton butterfly
-    kernels. fp32 only for now (no fake-quant in this path yet — that's
-    stage D).
+    kernels. Optional in-kernel fake-quant on hidden state via the same
+    ``(scale, qmin, qmax)`` per-tensor symmetric scheme as Monarch.
     """
 
     @staticmethod
@@ -861,17 +931,26 @@ class GRUScanButterflyTritonFunction(torch.autograd.Function):
         h0: torch.Tensor,
         twiddles: torch.Tensor,
         bh_cat: torch.Tensor,
+        h_in_quant: tuple[float, int, int] | None,
+        h_out_quant: tuple[float, int, int] | None,
     ) -> torch.Tensor:
-        out = gru_scan_butterfly_forward_triton(gi, h0, twiddles, bh_cat)
+        out = gru_scan_butterfly_forward_triton(
+            gi, h0, twiddles, bh_cat,
+            h_in_quant=h_in_quant, h_out_quant=h_out_quant,
+        )
         ctx.save_for_backward(gi, h0, twiddles, bh_cat, out)
+        ctx.h_in_quant = h_in_quant
+        ctx.h_out_quant = h_out_quant
         return out
 
     @staticmethod
     def backward(ctx, dout):  # type: ignore[override]
         gi, h0, twiddles, bh_cat, out = ctx.saved_tensors
-        return gru_scan_butterfly_backward_triton(
+        grads = gru_scan_butterfly_backward_triton(
             gi, h0, twiddles, bh_cat, out, dout,
+            h_in_quant=ctx.h_in_quant, h_out_quant=ctx.h_out_quant,
         )
+        return (*grads, None, None)
 
 
 def gru_scan_butterfly_triton(
@@ -879,6 +958,9 @@ def gru_scan_butterfly_triton(
     h0: torch.Tensor,
     twiddles: torch.Tensor,
     bh_cat: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Public API: differentiable Butterfly GRU scan via Triton kernels.
 
@@ -887,8 +969,12 @@ def gru_scan_butterfly_triton(
         h0:       [B, H]
         twiddles: [3, log_H, H/2, 2, 2]
         bh_cat:   [3*H]
+        h_in_quant / h_out_quant: optional ``(scale, qmin, qmax)`` —
+            same semantics as ``gru_scan_monarch``.
     """
-    return GRUScanButterflyTritonFunction.apply(gi, h0, twiddles, bh_cat)
+    return GRUScanButterflyTritonFunction.apply(
+        gi, h0, twiddles, bh_cat, h_in_quant, h_out_quant,
+    )
 
 
 def extract_butterfly_twiddles(

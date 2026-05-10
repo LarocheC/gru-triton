@@ -303,6 +303,73 @@ def test_butterfly_grulayer_triton_path_full_train_step() -> None:
 
 
 @cuda_only
+@pytest.mark.parametrize("T,B,H", [(8, 16, 32), (8, 32, 64)])
+def test_butterfly_triton_qat_forward_matches_per_step(
+    T: int, B: int, H: int
+) -> None:
+    """In-kernel fake-quant forward: Triton butterfly with quant params
+    must match the per-step CUDA-op path with matching h_in/h_out scales."""
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    layer = _make_layer(H, use_triton=False).to(device).eval()
+    x = torch.randn(T, B, H, device=device) * 0.1
+    h0 = torch.randn(B, H, device=device) * 0.1
+
+    bits = 8
+    qmin, qmax = -(2 ** (bits - 1)) + 1, 2 ** (bits - 1) - 1
+    h_q = (0.02, qmin, qmax)
+
+    with torch.no_grad():
+        xq = layer.cell.quant_x(x)
+        Wi_cat, bi_cat = layer.cell.quantize_input_weights()
+        gi = torch.nn.functional.linear(xq, Wi_cat, bi_cat)
+
+        # Per-step reference (CUDA op): use gru_scan_butterfly with
+        # h_in_quant / h_out_quant kwargs (already supports it).
+        modules, bh_cat = extract_butterfly_factors(layer.cell)
+        ref_out = gru_scan_butterfly(
+            gi, h0, modules, bh_cat,
+            h_in_quant=h_q, h_out_quant=h_q,
+        )
+
+        # Triton path with the same quant params.
+        from gru_qat.triton_kernels.scan_butterfly import gru_scan_butterfly_triton
+        twiddles, _ = extract_butterfly_twiddles(layer.cell)
+        tri_out = gru_scan_butterfly_triton(
+            gi, h0, twiddles, bh_cat,
+            h_in_quant=h_q, h_out_quant=h_q,
+        )
+
+    rel = (ref_out - tri_out).abs().max().item() / max(ref_out.abs().max().item(), 1e-6)
+    assert rel < 1e-1, f"qat forward rel diff {rel:.4e}"
+
+
+@cuda_only
+def test_butterfly_grulayer_qat_calibrate_freeze_triton_path() -> None:
+    """End-to-end: build, calibrate, freeze, forward through Triton
+    (QAT params get extracted from the frozen quantizers and the kernel
+    path runs)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    H, T, B = 32, 8, 16
+    layer = _make_layer(H, use_triton=True, hidden_bits=8).to(device)
+
+    def loader(n):
+        for _ in range(n):
+            yield torch.randn(T, B, H, device=device) * 0.1
+
+    layer.calibrate(loader(8), n_batches=8)
+    layer.freeze()
+
+    x = torch.randn(T, B, H, device=device) * 0.1
+    out, hT = layer(x)
+    assert torch.isfinite(out).all() and torch.isfinite(hT).all()
+    assert out.shape == (T, B, H)
+
+
+@cuda_only
 def test_butterfly_extract_and_gru_scan_directly() -> None:
     """Calling gru_scan_butterfly with factors extracted from a layer
     must produce the same result as routing through GRULayer."""
