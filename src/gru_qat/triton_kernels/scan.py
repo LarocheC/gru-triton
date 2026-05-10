@@ -77,11 +77,21 @@ def gru_scan_fwd_kernel(
     sh0_b,             # h0: batch (last dim contiguous)
     sW_o,              # Wh: output dim (last dim contiguous)
     so_t, so_b,        # out: time, batch (last dim contiguous)
+    # fake-quant params (per-tensor symmetric, frozen scale).
+    # When QUANT_H_IN/OUT is False the corresponding scale is unused.
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     # constexprs
     H: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_OH: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -120,6 +130,15 @@ def gru_scan_fwd_kernel(
                     mask=mask_b[:, None] & mask_k[None, :],
                     other=0.0,
                 )
+
+                # Apply quant_h_in to the matmul-side h. Per-tensor symmetric:
+                # q = clamp(round(x / s), qmin, qmax); out = q * s.
+                # Direct contribution to h_new uses the *unquantized* h (see
+                # gru_cell.step), so we only mutate this matmul-local copy.
+                if QUANT_H_IN:
+                    q = tl.extra.libdevice.rint(h_tile / h_in_scale)
+                    q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                    h_tile = q * h_in_scale
 
                 # Load Wh tiles: each [BLOCK_OH, BLOCK_K].
                 # Wh layout is row-major [3H, H]; sW_o is the row stride (= H).
@@ -182,6 +201,13 @@ def gru_scan_fwd_kernel(
             h_old = tl.load(h_old_ptrs, mask=mask_oh2, other=0.0)
             h_new = (1.0 - z) * n + z * h_old
 
+            # Apply quant_h_out before storing — the next step will read
+            # this back as h_prev, so it sees the post-quant value.
+            if QUANT_H_OUT:
+                q = tl.extra.libdevice.rint(h_new / h_out_scale)
+                q = tl.minimum(tl.maximum(q, h_out_qmin), h_out_qmax)
+                h_new = q * h_out_scale
+
             # Store h_new to out[t, :, oh:oh+BLOCK_OH].
             out_ptrs = (
                 out_ptr
@@ -230,11 +256,20 @@ def gru_scan_bwd_kernel(
     sdWp_pid, sdWp_o,
     sdbp_pid,
     sdh_b,
+    # fake-quant params (per-tensor symmetric, frozen scale)
+    h_in_scale,
+    h_in_qmin,
+    h_in_qmax,
+    h_out_scale,
+    h_out_qmin,
+    h_out_qmax,
     # constexprs
     H: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_OH: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    QUANT_H_IN: tl.constexpr,
+    QUANT_H_OUT: tl.constexpr,
 ):
     """Backward kernel for the multi-step GRU scan.
 
@@ -320,6 +355,12 @@ def gru_scan_bwd_kernel(
                     other=0.0,
                 )
 
+                # Apply quant_h_in to match the forward kernel.
+                if QUANT_H_IN:
+                    q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                    q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                    h_prev_tile = q * h_in_scale
+
                 W_offset = offs_oh[:, None] * sW_o + offs_k[None, :]
                 Wr_tile = tl.load(
                     Wh_ptr + 0 * H * sW_o + W_offset,
@@ -375,6 +416,16 @@ def gru_scan_bwd_kernel(
             dout_oh = tl.load(dout_base, mask=mask_oh2, other=0.0)
 
             dh_t = dout_oh + dh_acc_oh
+
+            # STE backward of quant_h_out: incoming dh_t is gradient on the
+            # quantized h_t (= post-quant_h_out). To get gradient on h_t_raw
+            # we multiply by the clip mask (1 inside qrange, 0 outside).
+            # Recompute h_t_raw to derive the mask.
+            if QUANT_H_OUT:
+                h_t_raw = (1.0 - z) * n + z * h_prev_oh
+                q_unclamped = tl.extra.libdevice.rint(h_t_raw / h_out_scale)
+                mask_out = (q_unclamped >= h_out_qmin) & (q_unclamped <= h_out_qmax)
+                dh_t = tl.where(mask_out, dh_t, 0.0)
 
             # h_t = (1 - z) * n + z * h_prev
             dn = dh_t * (1.0 - z)
@@ -464,6 +515,25 @@ def gru_scan_bwd_kernel(
                     + tl.dot(dgh_n, Wn_t, input_precision="tf32")
                 )
 
+                # STE backward of quant_h_in: contrib is gradient on the
+                # quantized h_prev (= input to the matmul). To propagate
+                # back to the unquantized h_prev (which is what dh_acc
+                # tracks), zero gradient where the value was clipped.
+                if QUANT_H_IN:
+                    h_prev_k_ptrs = (
+                        h_prev_ptr + offs_b[:, None] * sh_prev_b + offs_k[None, :]
+                    )
+                    h_prev_k = tl.load(
+                        h_prev_k_ptrs,
+                        mask=mask_b[:, None] & mask_k[None, :],
+                        other=0.0,
+                    )
+                    q_in_unclamped = tl.extra.libdevice.rint(h_prev_k / h_in_scale)
+                    mask_in = (q_in_unclamped >= h_in_qmin) & (
+                        q_in_unclamped <= h_in_qmax
+                    )
+                    contrib = tl.where(mask_in, contrib, 0.0)
+
                 # Add direct contribution from this oh tile (only when k == oh).
                 # Easiest: do it outside the k loop by adding to write buffer
                 # at offset oh. But since dh_prev_direct is per-oh, we add it
@@ -499,6 +569,13 @@ def gru_scan_bwd_kernel(
                     mask=mask_b[:, None] & mask_k[None, :],
                     other=0.0,
                 )
+
+                # Forward used hq = quant_h_in(h_prev) in the matmul, so
+                # dWh accumulates against hq, not raw h_prev.
+                if QUANT_H_IN:
+                    q = tl.extra.libdevice.rint(h_prev_tile / h_in_scale)
+                    q = tl.minimum(tl.maximum(q, h_in_qmin), h_in_qmax)
+                    h_prev_tile = q * h_in_scale
 
                 # [BLOCK_OH, BLOCK_B] @ [BLOCK_B, BLOCK_K] -> [BLOCK_OH, BLOCK_K]
                 dWr = tl.dot(tl.trans(dgh_r), h_prev_tile, input_precision="tf32")
@@ -560,6 +637,9 @@ def gru_scan_backward_triton(
     bh_cat: torch.Tensor,
     out: torch.Tensor,
     dout: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton multi-step backward.
 
@@ -597,6 +677,9 @@ def gru_scan_backward_triton(
     dh_a = torch.empty((B, H), device=gi.device, dtype=gi.dtype)
     dh_b = torch.empty((B, H), device=gi.device, dtype=gi.dtype)
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
     gru_scan_bwd_kernel[grid](
         gi, h0, Wh_cat, bh_cat, out,
@@ -615,12 +698,26 @@ def gru_scan_backward_triton(
         dWh_partial.stride(0), dWh_partial.stride(1),
         dbh_partial.stride(0),
         dh_a.stride(0),
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
     )
 
     dWh = dWh_partial.sum(dim=0)
     dbh = dbh_partial.sum(dim=0)
     return dgi, dh0, dWh, dbh
+
+
+def _fake_quant(
+    x: torch.Tensor, scale: float, qmin: int, qmax: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward fake-quant + the STE clip mask. Per-tensor symmetric, zp=0."""
+    q_unclamped = torch.round(x / scale)
+    mask = (q_unclamped >= qmin) & (q_unclamped <= qmax)
+    q_clamped = q_unclamped.clamp(qmin, qmax)
+    return q_clamped * scale, mask
 
 
 def _gru_scan_backward_pytorch(
@@ -630,6 +727,9 @@ def _gru_scan_backward_pytorch(
     bh_cat: torch.Tensor,
     out: torch.Tensor,
     dout: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference backward for the multi-step scan, in PyTorch.
 
@@ -655,15 +755,26 @@ def _gru_scan_backward_pytorch(
         h_prev = h0 if t == 0 else out[t - 1]
 
         gi_r, gi_z, gi_n = gi[t].chunk(3, dim=-1)
-        gh = h_prev @ Wh_cat.T + bh_cat
+        if h_in_quant is not None:
+            hq, mask_in = _fake_quant(h_prev, *h_in_quant)
+        else:
+            hq = h_prev
+            mask_in = None
+        gh = hq @ Wh_cat.T + bh_cat
         gh_r, gh_z, gh_n = gh.chunk(3, dim=-1)
         r = torch.sigmoid(gi_r + gh_r)
         z = torch.sigmoid(gi_z + gh_z)
         n = torch.tanh(gi_n + r * gh_n)
+        h_t_raw = (1.0 - z) * n + z * h_prev
 
         dh_t = dout[t] + dh_acc
 
-        # h_t = (1 - z) * n + z * h_prev
+        # STE backward through quant_h_out: gradient on h_t_q -> on h_t_raw.
+        if h_out_quant is not None:
+            _, mask_out = _fake_quant(h_t_raw, *h_out_quant)
+            dh_t = dh_t * mask_out
+
+        # h_t_raw = (1 - z) * n + z * h_prev (uses raw h_prev, not hq)
         dn = dh_t * (1.0 - z)
         dz = dh_t * (h_prev - n)
         dh_prev_direct = dh_t * z
@@ -689,9 +800,12 @@ def _gru_scan_backward_pytorch(
         dgi[t] = torch.cat([dgi_r, dgi_z, dgi_n], dim=-1)
         dgh = torch.cat([dgh_r, dgh_z, dgh_n], dim=-1)
 
-        # gh = h_prev @ Wh_cat^T + bh_cat
+        # gh = hq @ Wh_cat^T + bh_cat -> dWh accumulates against hq;
+        # dh_prev_via_W passes through STE backward of quant_h_in.
         dh_prev_via_W = dgh @ Wh_cat
-        dWh += dgh.transpose(0, 1) @ h_prev
+        if mask_in is not None:
+            dh_prev_via_W = dh_prev_via_W * mask_in
+        dWh += dgh.transpose(0, 1) @ hq
         dbh += dgh.sum(dim=0)
 
         dh_acc = dh_prev_direct + dh_prev_via_W
@@ -708,6 +822,9 @@ class GRUScanFunction(torch.autograd.Function):
     Forward is the Triton kernel. Backward is the Triton backward kernel by
     default; toggle `_USE_TRITON_BACKWARD` to fall back to the PyTorch
     reference (useful when debugging gradient drift).
+
+    Optional ``h_in_quant`` / ``h_out_quant`` enable in-kernel fake-quant
+    on the hidden state with a frozen per-tensor symmetric scale.
     """
 
     @staticmethod
@@ -717,19 +834,37 @@ class GRUScanFunction(torch.autograd.Function):
         h0: torch.Tensor,
         Wh_cat: torch.Tensor,
         bh_cat: torch.Tensor,
+        h_in_quant: tuple[float, int, int] | None,
+        h_out_quant: tuple[float, int, int] | None,
     ) -> torch.Tensor:
-        out = gru_scan_forward(gi, h0, Wh_cat, bh_cat)
+        out = gru_scan_forward(
+            gi, h0, Wh_cat, bh_cat,
+            h_in_quant=h_in_quant, h_out_quant=h_out_quant,
+        )
         ctx.save_for_backward(gi, h0, Wh_cat, bh_cat, out)
+        ctx.h_in_quant = h_in_quant
+        ctx.h_out_quant = h_out_quant
         return out
 
     @staticmethod
     def backward(  # type: ignore[override]
         ctx, dout: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ):
         gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
+        h_in_quant = ctx.h_in_quant
+        h_out_quant = ctx.h_out_quant
         if _USE_TRITON_BACKWARD:
-            return gru_scan_backward_triton(gi, h0, Wh_cat, bh_cat, out, dout)
-        return _gru_scan_backward_pytorch(gi, h0, Wh_cat, bh_cat, out, dout)
+            grads = gru_scan_backward_triton(
+                gi, h0, Wh_cat, bh_cat, out, dout,
+                h_in_quant=h_in_quant, h_out_quant=h_out_quant,
+            )
+        else:
+            grads = _gru_scan_backward_pytorch(
+                gi, h0, Wh_cat, bh_cat, out, dout,
+                h_in_quant=h_in_quant, h_out_quant=h_out_quant,
+            )
+        # Two trailing Nones for the non-tensor h_in_quant / h_out_quant args.
+        return (*grads, None, None)
 
 
 def gru_scan(
@@ -737,9 +872,19 @@ def gru_scan(
     h0: torch.Tensor,
     Wh_cat: torch.Tensor,
     bh_cat: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
-    """Public API: differentiable multi-step GRU scan."""
-    return GRUScanFunction.apply(gi, h0, Wh_cat, bh_cat)
+    """Public API: differentiable multi-step GRU scan.
+
+    With ``h_in_quant`` / ``h_out_quant`` supplied (each a
+    ``(scale, qmin, qmax)`` tuple), the kernel applies in-kernel fake-quant
+    on the hidden state on every step. Per-tensor symmetric, frozen scale.
+    """
+    return GRUScanFunction.apply(
+        gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+    )
 
 
 def gru_scan_forward(
@@ -747,6 +892,9 @@ def gru_scan_forward(
     h0: torch.Tensor,
     Wh_cat: torch.Tensor,
     bh_cat: torch.Tensor,
+    *,
+    h_in_quant: tuple[float, int, int] | None = None,
+    h_out_quant: tuple[float, int, int] | None = None,
 ) -> torch.Tensor:
     """Forward pass of the multi-step GRU scan in Triton.
 
@@ -775,6 +923,9 @@ def gru_scan_forward(
 
     out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
 
+    in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
+    out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
+
     # Autotune picks BLOCK_B/OH/K. Grid is a meta-lambda so it sizes from
     # whatever BLOCK_B the autotuner chose for this (T, B, H) cell.
     grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
@@ -792,6 +943,10 @@ def gru_scan_forward(
         Wh_cat.stride(0),
         out.stride(0),
         out.stride(1),
+        in_s, in_qmin, in_qmax,
+        out_s, out_qmin, out_qmax,
         H=H,
+        QUANT_H_IN=h_in_quant is not None,
+        QUANT_H_OUT=h_out_quant is not None,
     )
     return out

@@ -123,3 +123,86 @@ def test_triton_backward_matches_pytorch(T: int, B: int, IN: int, H: int) -> Non
         max_diff = (ref_g - tri_g).abs().max().item()
         rel = max_diff / max(ref_g.abs().max().item(), 1e-6)
         assert rel < 1e-1, f"{name} grad rel diff {rel:.4f} exceeds 1e-1"
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,IN,H", [(8, 4, 16, 32), (16, 8, 16, 32)])
+def test_triton_qat_matches_pytorch(T: int, B: int, IN: int, H: int) -> None:
+    """In-kernel fake-quant on the hidden state must match the cell's
+    quant_h_in / quant_h_out semantics, both forward and backward.
+
+    Reference path: a GRULayer with hidden quantizer manually frozen at a
+    chosen scale. Triton path: gru_scan() with the same scale / qrange.
+    """
+    from gru_qat.gru_layer import GRULayer
+    from gru_qat.quantizers import (
+        FakeQuantizePerTensor,
+        QuantizerConfig,
+        QuantRecipe,
+    )
+    from gru_qat.triton_kernels.scan import gru_scan
+
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+
+    # int8 symmetric, frozen at a sensible scale for the synthetic data.
+    bits = 8
+    qmin, qmax = -(2 ** (bits - 1)) + 1, 2 ** (bits - 1) - 1
+    h_scale = 0.02  # keeps activations in-range for the random init below
+
+    rec = QuantRecipe(
+        weight=QuantizerConfig(bits=32, axis=0, name="W_id"),  # weights fp32
+        input_act=QuantizerConfig(bits=32, name="x_id"),       # input fp32
+        hidden=QuantizerConfig(bits=bits, mode="frozen", name="h_q"),
+    )
+    ref = GRULayer(
+        IN, H, recipe=rec, gate_layout="fused", pre_batch_input=True
+    ).to(device)
+    # Manually set the frozen scales on quant_h_in and quant_h_out.
+    for q in (ref.cell.quant_h_in, ref.cell.quant_h_out):
+        assert isinstance(q, FakeQuantizePerTensor)
+        q.scale = torch.tensor(h_scale, device=device)
+        q.zero_point = torch.tensor(0.0, device=device)
+
+    x = torch.randn(T, B, IN, device=device) * 0.1
+    h0 = torch.randn(B, H, device=device) * 0.1
+
+    # ----- Reference forward+backward -----
+    ref_x = x.detach().clone().requires_grad_()
+    ref_h0 = h0.detach().clone().requires_grad_()
+    ref_out, _ = ref(ref_x, ref_h0)
+    ref_loss = ref_out.float().pow(2).sum()
+    ref_loss.backward()
+
+    # ----- Triton path -----
+    w = ref.cell.quantize_weights()
+    Wi_cat = w.Wi_cat.detach().clone()
+    bi_cat = w.bi_cat.detach().clone()
+    Wh_cat = w.Wh_cat.detach().clone().requires_grad_()
+    bh_cat = w.bh_cat.detach().clone().requires_grad_()
+    tri_x = x.detach().clone().requires_grad_()
+    tri_h0 = h0.detach().clone().requires_grad_()
+    gi = torch.nn.functional.linear(tri_x, Wi_cat, bi_cat)
+    out = gru_scan(
+        gi, tri_h0, Wh_cat, bh_cat,
+        h_in_quant=(h_scale, qmin, qmax),
+        h_out_quant=(h_scale, qmin, qmax),
+    )
+    loss = out.float().pow(2).sum()
+    loss.backward()
+
+    # Forward output parity. Tolerance is loose: per-step fake-quant noise
+    # plus TF32 matmul noise compounds across T timesteps.
+    fwd_diff = (ref_out - out).abs().max().item()
+    fwd_rel = fwd_diff / max(ref_out.abs().max().item(), 1e-6)
+    assert fwd_rel < 1e-1, f"fwd rel diff {fwd_rel:.4f}"
+
+    # Gradient parity on x and h0
+    for name, ref_g, tri_g in [
+        ("x", ref_x.grad, tri_x.grad),
+        ("h0", ref_h0.grad, tri_h0.grad),
+    ]:
+        max_diff = (ref_g - tri_g).abs().max().item()
+        rel = max_diff / max(ref_g.abs().max().item(), 1e-6)
+        assert rel < 2e-1, f"{name} grad rel diff {rel:.4f}"
