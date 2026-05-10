@@ -35,6 +35,33 @@ import triton
 import triton.language as tl
 
 
+# Configs tuned for sm_89 (Ada). SMEM ~100KB/CTA; tile sizes chosen so
+# inner-loop accumulators + W tiles + h tile fit at the listed num_stages.
+# BLOCK_B >= 16 because tl.dot in the backward has K = BLOCK_B for the
+# dWh accumulation step. Smallest BLOCK_B determines the partial-buffer
+# allocation in the Python wrapper.
+_AUTOTUNE_CONFIGS_FWD = [
+    triton.Config({"BLOCK_B": 16, "BLOCK_OH": 32, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_B": 16, "BLOCK_OH": 64, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_B": 16, "BLOCK_OH": 64, "BLOCK_K": 64}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_B": 16, "BLOCK_OH": 128, "BLOCK_K": 32}, num_stages=2, num_warps=8),
+    triton.Config({"BLOCK_B": 32, "BLOCK_OH": 32, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_B": 32, "BLOCK_OH": 64, "BLOCK_K": 32}, num_stages=2, num_warps=8),
+    triton.Config({"BLOCK_B": 32, "BLOCK_OH": 32, "BLOCK_K": 64}, num_stages=2, num_warps=8),
+]
+# The backward has more SMEM pressure (extra accumulators for dh_acc
+# updates), so keep tile budget a bit smaller.
+_AUTOTUNE_CONFIGS_BWD = [
+    triton.Config({"BLOCK_B": 16, "BLOCK_OH": 32, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_B": 16, "BLOCK_OH": 64, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_B": 16, "BLOCK_OH": 64, "BLOCK_K": 64}, num_stages=1, num_warps=4),
+    triton.Config({"BLOCK_B": 32, "BLOCK_OH": 32, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+    triton.Config({"BLOCK_B": 32, "BLOCK_OH": 32, "BLOCK_K": 64}, num_stages=1, num_warps=8),
+]
+_MIN_AUTOTUNE_BLOCK_B = 16
+
+
+@triton.autotune(configs=_AUTOTUNE_CONFIGS_FWD, key=["T", "B"])
 @triton.jit
 def gru_scan_fwd_kernel(
     gi_ptr,            # [T, B, 3H], fp32
@@ -169,6 +196,7 @@ def gru_scan_fwd_kernel(
         sh_b = so_b
 
 
+@triton.autotune(configs=_AUTOTUNE_CONFIGS_BWD, key=["T", "B"])
 @triton.jit
 def gru_scan_bwd_kernel(
     # forward inputs (saved tensors, read-only)
@@ -532,12 +560,6 @@ def gru_scan_backward_triton(
     bh_cat: torch.Tensor,
     out: torch.Tensor,
     dout: torch.Tensor,
-    *,
-    block_b: int = 16,
-    block_oh: int = 64,
-    block_k: int = 32,
-    num_stages: int = 2,
-    num_warps: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton multi-step backward.
 
@@ -558,29 +580,24 @@ def gru_scan_backward_triton(
     out = out.contiguous()
     dout = dout.contiguous()
 
-    # Clamp tile sizes so BLOCK_OH and BLOCK_K never exceed H — when they
-    # do, the masked Wh loads spill into adjacent gate rows, and even with
-    # mask=False the TF32 path produces wrong results (garbage in the
-    # masked region of the matmul accumulator). With the clamp we always
-    # have a clean tile boundary at H. tl.dot still requires K >= 16, so
-    # don't go below that.
-    block_oh = max(16, min(block_oh, H))
-    block_k = max(16, min(block_k, H))
-
     dgi = torch.zeros_like(gi)
     dh0 = torch.zeros_like(h0)
 
-    n_pid = triton.cdiv(B, block_b)
+    # Over-allocate partial buffers based on the smallest BLOCK_B in the
+    # autotune grid. Programs that aren't launched (because autotune chose
+    # a larger BLOCK_B) leave their slabs at zero, which is a no-op when
+    # we sum across the program dim afterwards.
+    n_pid_max = triton.cdiv(B, _MIN_AUTOTUNE_BLOCK_B)
     dWh_partial = torch.zeros(
-        (n_pid, 3 * H, H), device=gi.device, dtype=gi.dtype
+        (n_pid_max, 3 * H, H), device=gi.device, dtype=gi.dtype
     )
     dbh_partial = torch.zeros(
-        (n_pid, 3 * H), device=gi.device, dtype=gi.dtype
+        (n_pid_max, 3 * H), device=gi.device, dtype=gi.dtype
     )
     dh_a = torch.empty((B, H), device=gi.device, dtype=gi.dtype)
     dh_b = torch.empty((B, H), device=gi.device, dtype=gi.dtype)
 
-    grid = (n_pid,)
+    grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
     gru_scan_bwd_kernel[grid](
         gi, h0, Wh_cat, bh_cat, out,
         dout,
@@ -599,11 +616,6 @@ def gru_scan_backward_triton(
         dbh_partial.stride(0),
         dh_a.stride(0),
         H=H,
-        BLOCK_B=block_b,
-        BLOCK_OH=block_oh,
-        BLOCK_K=block_k,
-        num_stages=num_stages,
-        num_warps=num_warps,
     )
 
     dWh = dWh_partial.sum(dim=0)
@@ -735,12 +747,6 @@ def gru_scan_forward(
     h0: torch.Tensor,
     Wh_cat: torch.Tensor,
     bh_cat: torch.Tensor,
-    *,
-    block_b: int = 16,
-    block_oh: int = 64,
-    block_k: int = 32,
-    num_stages: int = 2,
-    num_warps: int = 4,
 ) -> torch.Tensor:
     """Forward pass of the multi-step GRU scan in Triton.
 
@@ -769,11 +775,9 @@ def gru_scan_forward(
 
     out = torch.empty((T, B, H), device=gi.device, dtype=gi.dtype)
 
-    # Same clamp as the backward — keep tile boundaries inside H.
-    block_oh = max(16, min(block_oh, H))
-    block_k = max(16, min(block_k, H))
-
-    grid = (triton.cdiv(B, block_b),)
+    # Autotune picks BLOCK_B/OH/K. Grid is a meta-lambda so it sizes from
+    # whatever BLOCK_B the autotuner chose for this (T, B, H) cell.
+    grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
     gru_scan_fwd_kernel[grid](
         gi,
         h0,
@@ -789,10 +793,5 @@ def gru_scan_forward(
         out.stride(0),
         out.stride(1),
         H=H,
-        BLOCK_B=block_b,
-        BLOCK_OH=block_oh,
-        BLOCK_K=block_k,
-        num_stages=num_stages,
-        num_warps=num_warps,
     )
     return out
