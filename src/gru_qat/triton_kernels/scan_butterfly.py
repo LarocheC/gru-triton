@@ -172,28 +172,38 @@ def gru_scan_butterfly_fwd_kernel(
     h_out_qmin,
     h_out_qmax,
     H: tl.constexpr,
-    LOG_H: tl.constexpr,
+    H_PAD: tl.constexpr,
+    LOG_H_PAD: tl.constexpr,
     BLOCK_B: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
 ):
     """Persistent forward over the butterfly recurrence.
 
-    Each program holds [BLOCK_B, H] state across T timesteps. Within a
-    timestep, three gate-specific butterfly multiplies run in sequence
-    on a per-program scratch buffer, then the gate compose / recurrence
+    Each program holds [BLOCK_B, H_PAD] state across T timesteps (H_PAD
+    is next_pow2(H), Triton needs pow-2 tl.arange). Within a timestep,
+    three gate-specific butterfly multiplies run in sequence on a
+    per-program scratch buffer, then the gate compose / recurrence
     update produces h_t. No cross-CTA sync — butterfly is per-row
     independent so each batch tile can run in isolation.
+
+    Dense tensors (h0, gi, out, bh, dh0, dgi, dout, dbh) are sized at H,
+    not H_PAD; mask_h = offs_h < H excludes the padded tail from those
+    loads/stores. Scratch (program-local) and twiddle are at H_PAD,
+    which torch_structured.Butterfly already produces for non-pow2 H.
     """
     pid_b = tl.program_id(0)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
-    offs_h = tl.arange(0, H)
+    offs_h = tl.arange(0, H_PAD)
+    mask_h = offs_h < H
+    mask_bh = mask_b[:, None] & mask_h[None, :]
 
-    # Pre-load bias per gate.
-    bhr = tl.load(bh_ptr + 0 * H + offs_h)
-    bhz = tl.load(bh_ptr + 1 * H + offs_h)
-    bhn = tl.load(bh_ptr + 2 * H + offs_h)
+    # Pre-load bias per gate; padded lanes = 0 so they contribute 0
+    # additively in the recurrence.
+    bhr = tl.load(bh_ptr + 0 * H + offs_h, mask=mask_h, other=0.0)
+    bhz = tl.load(bh_ptr + 1 * H + offs_h, mask=mask_h, other=0.0)
+    bhn = tl.load(bh_ptr + 2 * H + offs_h, mask=mask_h, other=0.0)
 
     # This program's scratch slab.
     scr_base = scratch_ptr + pid_b * sscr_pid
@@ -206,10 +216,12 @@ def gru_scan_butterfly_fwd_kernel(
         # Stage 0 of butterfly: copy h_in into all three gate scratch
         # buffers (we'll mutate them in place across stages). Apply
         # quant_h_in to the matmul-side h; the direct contribution
-        # `(1-z)*n + z*h_self` below uses the raw h_self.
+        # `(1-z)*n + z*h_self` below uses the raw h_self. mask_bh
+        # zeros the padded slots so the butterfly stages see a clean
+        # zero-extended input.
         h_self = tl.load(
             h_in_ptr + offs_b[:, None] * sh_b + offs_h[None, :],
-            mask=mask_b[:, None], other=0.0,
+            mask=mask_bh, other=0.0,
         )
         if QUANT_H_IN:
             q = tl.extra.cuda.libdevice.rint(h_self / h_in_scale)
@@ -225,8 +237,8 @@ def gru_scan_butterfly_fwd_kernel(
                 mask=mask_b[:, None],
             )
 
-        # Run log_H butterfly stages on each gate's scratch buffer.
-        for s in range(LOG_H):
+        # Run LOG_H_PAD butterfly stages on each gate's scratch buffer.
+        for s in range(LOG_H_PAD):
             stride_s = 1 << s
             partner = offs_h ^ stride_s
             # member ∈ {0, 1}: which side of the pair this position is.
@@ -290,9 +302,9 @@ def gru_scan_butterfly_fwd_kernel(
         gi_base = (
             gi_ptr + t * sg_t + offs_b[:, None] * sg_b + offs_h[None, :]
         )
-        gir = tl.load(gi_base + 0 * H, mask=mask_b[:, None], other=0.0)
-        giz = tl.load(gi_base + 1 * H, mask=mask_b[:, None], other=0.0)
-        gin = tl.load(gi_base + 2 * H, mask=mask_b[:, None], other=0.0)
+        gir = tl.load(gi_base + 0 * H, mask=mask_bh, other=0.0)
+        giz = tl.load(gi_base + 1 * H, mask=mask_bh, other=0.0)
+        gin = tl.load(gi_base + 2 * H, mask=mask_bh, other=0.0)
 
         r = tl.sigmoid(gir + gh_r)
         z = tl.sigmoid(giz + gh_z)
@@ -307,7 +319,7 @@ def gru_scan_butterfly_fwd_kernel(
         out_ptrs = (
             out_ptr + t * so_t + offs_b[:, None] * so_b + offs_h[None, :]
         )
-        tl.store(out_ptrs, h_new, mask=mask_b[:, None])
+        tl.store(out_ptrs, h_new, mask=mask_bh)
 
         # Next step reads from out[t] for h_in.
         h_in_ptr = out_ptr + t * so_t
@@ -342,11 +354,16 @@ def gru_scan_butterfly_forward_triton(
     T, B, three_H = gi.shape
     H = three_H // 3
     assert h0.shape == (B, H)
-    assert (H & (H - 1)) == 0, "butterfly requires H to be a power of 2"
-    log_H = int(math.log2(H))
+    # H itself may be non-pow2; the butterfly multiply runs on H_PAD =
+    # next_pow_2(H). torch_structured.Butterfly already sizes its
+    # twiddles at the padded shape internally, so log_n / n//2 come from
+    # the twiddle tensor, not from H directly.
     n_gates, log_n_t, n_div_2_t, two1, two2 = twiddles.shape
-    assert n_gates == 3 and log_n_t == log_H and n_div_2_t == H // 2
-    assert two1 == 2 and two2 == 2
+    assert n_gates == 3 and two1 == 2 and two2 == 2
+    H_PAD = n_div_2_t * 2
+    log_H_pad = log_n_t
+    assert H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0
+    assert 1 << log_H_pad == H_PAD
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -357,10 +374,11 @@ def gru_scan_butterfly_forward_triton(
 
     n_pid_b = triton.cdiv(B, block_b)
     # Scratch: 4 buffers per program (3 gates + 1 unused/aligned), each
-    # [BLOCK_B, H]. We allocate 4 to keep stride math simple; the 4th is
-    # unused at the moment but reserved for the backward kernel.
+    # [BLOCK_B, H_PAD]. Padded slots hold the butterfly's per-stage
+    # output for "imaginary" positions; they're never written back to
+    # dense H tensors.
     scratch = torch.empty(
-        (n_pid_b, 4, block_b, H), device=gi.device, dtype=gi.dtype,
+        (n_pid_b, 4, block_b, H_PAD), device=gi.device, dtype=gi.dtype,
     )
 
     in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
@@ -379,7 +397,8 @@ def gru_scan_butterfly_forward_triton(
         in_s, in_qmin, in_qmax,
         out_s, out_qmin, out_qmax,
         H=H,
-        LOG_H=log_H,
+        H_PAD=H_PAD,
+        LOG_H_PAD=log_H_pad,
         BLOCK_B=block_b,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
@@ -427,7 +446,8 @@ def gru_scan_butterfly_bwd_kernel(
     h_out_qmin,
     h_out_qmax,
     H: tl.constexpr,
-    LOG_H: tl.constexpr,
+    H_PAD: tl.constexpr,
+    LOG_H_PAD: tl.constexpr,
     BLOCK_B: tl.constexpr,
     QUANT_H_IN: tl.constexpr,
     QUANT_H_OUT: tl.constexpr,
@@ -436,7 +456,7 @@ def gru_scan_butterfly_bwd_kernel(
 
     Walks t from T-1 down to 0. Per timestep:
     - Recomputes butterfly forward for all 3 gates, saving the
-      per-stage states into the scratch buffer (log_H+1 states per gate).
+      per-stage states into the scratch buffer (LOG_H_PAD+1 states per gate).
     - Backprops through the gate compose to get dgh_r, dgh_z, dgh_n.
     - Backprops through each butterfly via reverse-stage walk, using
       saved states. Accumulates dtwiddle_partial (per pid_b, summed
@@ -446,23 +466,33 @@ def gru_scan_butterfly_bwd_kernel(
 
     No cross-CTA sync needed (butterfly is per-row independent), so
     dh_acc is a single buffer per program with disjoint writes.
+
+    Padded-H handling: dense tensors (h0, gi, out, bh, dh0, dgi, dout,
+    dh_acc, dbh) are sized at H; mask_h = offs_h < H excludes padded
+    slots from those loads/stores. Scratch (state buffer), twiddle, and
+    dtwiddle_partial are at H_PAD. The padded-H butterfly is
+    mathematically equivalent to multiplying x by the top-left H x H
+    submatrix of the H_PAD butterfly; the H_PAD twiddle parameters all
+    receive non-zero gradient and are co-trained.
     """
     pid_b = tl.program_id(0)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     mask_b = offs_b < B
-    offs_h = tl.arange(0, H)
+    offs_h = tl.arange(0, H_PAD)
+    mask_h = offs_h < H
+    mask_bh = mask_b[:, None] & mask_h[None, :]
 
-    bhr = tl.load(bh_ptr + 0 * H + offs_h)  # noqa: F841 (kept for symmetry)
-    bhz = tl.load(bh_ptr + 1 * H + offs_h)  # noqa: F841
-    bhn = tl.load(bh_ptr + 2 * H + offs_h)  # noqa: F841
+    bhr = tl.load(bh_ptr + 0 * H + offs_h, mask=mask_h, other=0.0)  # noqa: F841
+    bhz = tl.load(bh_ptr + 1 * H + offs_h, mask=mask_h, other=0.0)  # noqa: F841
+    bhn = tl.load(bh_ptr + 2 * H + offs_h, mask=mask_h, other=0.0)  # noqa: F841
 
     state_base = state_ptr + pid_b * sst_pid
 
-    # Initialize dh_acc[:, :] to 0 for this program's batch tile.
+    # Initialize dh_acc[:, :] to 0 for this program's batch tile (real H).
     tl.store(
         dh_acc_ptr + offs_b[:, None] * sdh_b + offs_h[None, :],
-        tl.zeros((BLOCK_B, H), dtype=tl.float32),
-        mask=mask_b[:, None],
+        tl.zeros((BLOCK_B, H_PAD), dtype=tl.float32),
+        mask=mask_bh,
     )
 
     for t_rev in range(T):
@@ -475,10 +505,12 @@ def gru_scan_butterfly_bwd_kernel(
             h_prev_ptr = out_ptr + (t - 1) * so_t
             sh_prev_b = so_b
 
-        # Load h_prev once.
+        # Load h_prev once. Padded slots zeroed so the butterfly
+        # recompute sees the same zero-extended input as the forward
+        # kernel did.
         h_prev = tl.load(
             h_prev_ptr + offs_b[:, None] * sh_prev_b + offs_h[None, :],
-            mask=mask_b[:, None], other=0.0,
+            mask=mask_bh, other=0.0,
         )
 
         # ---- Recompute butterfly forward, saving per-stage states ----
@@ -499,7 +531,7 @@ def gru_scan_butterfly_bwd_kernel(
                 mask=mask_b[:, None],
             )
         # Run stages, saving each output.
-        for s in range(LOG_H):
+        for s in range(LOG_H_PAD):
             stride_s = 1 << s
             partner = offs_h ^ stride_s
             member = (offs_h >> s) & 1
@@ -527,10 +559,10 @@ def gru_scan_butterfly_bwd_kernel(
                     mask=mask_b[:, None],
                 )
 
-        # state[g, log_H] is the final butterfly output. Recompute gh, gates.
-        end_r = state_base + 0 * sst_g + LOG_H * sst_l
-        end_z = state_base + 1 * sst_g + LOG_H * sst_l
-        end_n = state_base + 2 * sst_g + LOG_H * sst_l
+        # state[g, LOG_H_PAD] is the final butterfly output. Recompute gh, gates.
+        end_r = state_base + 0 * sst_g + LOG_H_PAD * sst_l
+        end_z = state_base + 1 * sst_g + LOG_H_PAD * sst_l
+        end_n = state_base + 2 * sst_g + LOG_H_PAD * sst_l
         gh_r = tl.load(
             end_r + offs_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
@@ -547,9 +579,9 @@ def gru_scan_butterfly_bwd_kernel(
         gi_base = (
             gi_ptr + t * sg_t + offs_b[:, None] * sg_b + offs_h[None, :]
         )
-        gir = tl.load(gi_base + 0 * H, mask=mask_b[:, None], other=0.0)
-        giz = tl.load(gi_base + 1 * H, mask=mask_b[:, None], other=0.0)
-        gin = tl.load(gi_base + 2 * H, mask=mask_b[:, None], other=0.0)
+        gir = tl.load(gi_base + 0 * H, mask=mask_bh, other=0.0)
+        giz = tl.load(gi_base + 1 * H, mask=mask_bh, other=0.0)
+        gin = tl.load(gi_base + 2 * H, mask=mask_bh, other=0.0)
 
         r = tl.sigmoid(gir + gh_r)
         z = tl.sigmoid(giz + gh_z)
@@ -558,11 +590,11 @@ def gru_scan_butterfly_bwd_kernel(
         # ---- Read incoming dh_acc and dout[t] ----
         dh_acc_oh = tl.load(
             dh_acc_ptr + offs_b[:, None] * sdh_b + offs_h[None, :],
-            mask=mask_b[:, None], other=0.0,
+            mask=mask_bh, other=0.0,
         )
         dout_oh = tl.load(
             dout_ptr + t * sdo_t + offs_b[:, None] * sdo_b + offs_h[None, :],
-            mask=mask_b[:, None], other=0.0,
+            mask=mask_bh, other=0.0,
         )
         dh_t = dout_oh + dh_acc_oh
 
@@ -596,32 +628,41 @@ def gru_scan_butterfly_bwd_kernel(
         dgi_base = (
             dgi_ptr + t * sdgi_t + offs_b[:, None] * sdgi_b + offs_h[None, :]
         )
-        tl.store(dgi_base + 0 * H, dgi_r, mask=mask_b[:, None])
-        tl.store(dgi_base + 1 * H, dgi_z, mask=mask_b[:, None])
-        tl.store(dgi_base + 2 * H, dgi_n, mask=mask_b[:, None])
+        tl.store(dgi_base + 0 * H, dgi_r, mask=mask_bh)
+        tl.store(dgi_base + 1 * H, dgi_z, mask=mask_bh)
+        tl.store(dgi_base + 2 * H, dgi_n, mask=mask_bh)
 
-        # Accumulate dbh_partial (sum across batch).
+        # Accumulate dbh_partial (sum across batch). dbh is sized [3*H]
+        # so the padded oh tail must be masked or it'd land in the
+        # next gate slot.
         dbh_base = dbh_partial_ptr + pid_b * sdbp_pid + offs_h
         tl.store(
             dbh_base + 0 * H,
-            tl.load(dbh_base + 0 * H) + tl.sum(dgh_r, axis=0),
+            tl.load(dbh_base + 0 * H, mask=mask_h, other=0.0) + tl.sum(dgh_r, axis=0),
+            mask=mask_h,
         )
         tl.store(
             dbh_base + 1 * H,
-            tl.load(dbh_base + 1 * H) + tl.sum(dgh_z, axis=0),
+            tl.load(dbh_base + 1 * H, mask=mask_h, other=0.0) + tl.sum(dgh_z, axis=0),
+            mask=mask_h,
         )
         tl.store(
             dbh_base + 2 * H,
-            tl.load(dbh_base + 2 * H) + tl.sum(dgh_n, axis=0),
+            tl.load(dbh_base + 2 * H, mask=mask_h, other=0.0) + tl.sum(dgh_n, axis=0),
+            mask=mask_h,
         )
 
         # ---- Backward through butterfly stages, per gate ----
-        # Initialize d_state per gate to dgh_g at state[log_H]. We reuse
-        # the state buffer for d_state during backward (the forward state
-        # at log_H is no longer needed once we've started).
-        d_dst_r = state_base + 0 * sst_g + LOG_H * sst_l
-        d_dst_z = state_base + 1 * sst_g + LOG_H * sst_l
-        d_dst_n = state_base + 2 * sst_g + LOG_H * sst_l
+        # Initialize d_state per gate to dgh_g at state[LOG_H_PAD]. We
+        # reuse the state buffer for d_state during backward (the
+        # forward state at LOG_H_PAD is no longer needed once we've
+        # started). Padded slots of dgh_g are zero (gi/dh_acc/dout were
+        # all zero there via mask_bh, so dh_t and its derived dgh_g are
+        # zero), so initialising state[*, LOG_H_PAD] without mask_h is
+        # safe — padded entries seed the reverse walk at 0.
+        d_dst_r = state_base + 0 * sst_g + LOG_H_PAD * sst_l
+        d_dst_z = state_base + 1 * sst_g + LOG_H_PAD * sst_l
+        d_dst_n = state_base + 2 * sst_g + LOG_H_PAD * sst_l
         tl.store(
             d_dst_r + offs_b[:, None] * sst_b + offs_h[None, :],
             dgh_r, mask=mask_b[:, None],
@@ -635,9 +676,9 @@ def gru_scan_butterfly_bwd_kernel(
             dgh_n, mask=mask_b[:, None],
         )
 
-        # Walk stages s from LOG_H-1 down to 0.
-        for s_rev in range(LOG_H):
-            s = LOG_H - 1 - s_rev
+        # Walk stages s from LOG_H_PAD-1 down to 0.
+        for s_rev in range(LOG_H_PAD):
+            s = LOG_H_PAD - 1 - s_rev
             stride_s = 1 << s
             partner = offs_h ^ stride_s
             member = (offs_h >> s) & 1
@@ -811,21 +852,25 @@ def gru_scan_butterfly_bwd_kernel(
             dh_via = tl.where(mask_in, dh_via, 0.0)
         dh_acc_new = dh_prev_direct + dh_via
 
+        # Padded slots of dh_via carry "grad w.r.t. the zero-padded
+        # input" — not a real parameter, discarded. mask_bh prevents
+        # those values from writing past the [B, H] row boundary in
+        # dh_acc.
         tl.store(
             dh_acc_ptr + offs_b[:, None] * sdh_b + offs_h[None, :],
             dh_acc_new,
-            mask=mask_b[:, None],
+            mask=mask_bh,
         )
 
     # After loop, dh_acc holds dh0 for this batch tile.
     dh_final = tl.load(
         dh_acc_ptr + offs_b[:, None] * sdh_b + offs_h[None, :],
-        mask=mask_b[:, None], other=0.0,
+        mask=mask_bh, other=0.0,
     )
     tl.store(
         dh0_ptr + offs_b[:, None] * sdh0_b + offs_h[None, :],
         dh_final,
-        mask=mask_b[:, None],
+        mask=mask_bh,
     )
 
 
@@ -849,9 +894,13 @@ def gru_scan_butterfly_backward_triton(
     """
     T, B, three_H = gi.shape
     H = three_H // 3
-    assert (H & (H - 1)) == 0, "butterfly requires H to be a power of 2"
-    log_H = int(math.log2(H))
-    assert twiddles.shape == (3, log_H, H // 2, 2, 2)
+    # H may be non-pow2; the kernel operates on H_PAD = next_pow_2(H)
+    # internally. Twiddle is already at H_PAD via torch_structured.
+    n_gates, log_H_pad, n_div_2_t, two1, two2 = twiddles.shape
+    assert n_gates == 3 and two1 == 2 and two2 == 2
+    H_PAD = n_div_2_t * 2
+    assert H_PAD >= H and (H_PAD & (H_PAD - 1)) == 0
+    assert 1 << log_H_pad == H_PAD
 
     gi = gi.contiguous()
     h0 = h0.contiguous()
@@ -865,17 +914,17 @@ def gru_scan_butterfly_backward_triton(
 
     n_pid_b = triton.cdiv(B, block_b)
     dtwiddle_partial = torch.zeros(
-        (n_pid_b, 3, log_H, H // 2, 2, 2),
+        (n_pid_b, 3, log_H_pad, H_PAD // 2, 2, 2),
         device=gi.device, dtype=gi.dtype,
     )
     dbh_partial = torch.zeros(
         (n_pid_b, 3 * H), device=gi.device, dtype=gi.dtype,
     )
     # Per-program scratch holds the per-stage state for backward.
-    # Shape: [num_pid_b, 3 (gates), log_H + 1 (stages including input),
-    #         BLOCK_B, H].
+    # Shape: [num_pid_b, 3 (gates), LOG_H_PAD + 1 (stages including input),
+    #         BLOCK_B, H_PAD].
     state = torch.empty(
-        (n_pid_b, 3, log_H + 1, block_b, H),
+        (n_pid_b, 3, log_H_pad + 1, block_b, H_PAD),
         device=gi.device, dtype=gi.dtype,
     )
     dh_acc = torch.empty((B, H), device=gi.device, dtype=gi.dtype)
@@ -907,7 +956,7 @@ def gru_scan_butterfly_backward_triton(
         dh_acc.stride(0),
         in_s, in_qmin, in_qmax,
         out_s, out_qmin, out_qmax,
-        H=H, LOG_H=log_H, BLOCK_B=block_b,
+        H=H, H_PAD=H_PAD, LOG_H_PAD=log_H_pad, BLOCK_B=block_b,
         QUANT_H_IN=h_in_quant is not None,
         QUANT_H_OUT=h_out_quant is not None,
         num_warps=num_warps, num_stages=num_stages,
