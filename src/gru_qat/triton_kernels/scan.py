@@ -972,6 +972,37 @@ def gru_scan_bwd_kernel(
             mask=mask_b[:, None] & mask_h[None, :],
         )
 
+    # Zero this program's slab of dWh_partial and dbh_partial. The recurrence
+    # loop below does load-add-store into these (each program owns unique
+    # rows so no atomic needed), which is only correct if the slab is zero on
+    # entry. The Python wrapper allocates with torch.zeros, but @triton.autotune
+    # reuses the same buffer across all trial configs — every trial accumulates
+    # into the prior trial's result. Zeroing per-program here makes each
+    # kernel launch idempotent.
+    for row_off in range(0, 3 * H, BLOCK_OH):
+        offs_row = row_off + tl.arange(0, BLOCK_OH)
+        mask_row = offs_row < 3 * H
+        for col_off in range(0, H, BLOCK_K):
+            offs_col = col_off + tl.arange(0, BLOCK_K)
+            mask_col = offs_col < H
+            dWp_ptrs = (
+                dWh_partial_ptr
+                + pid_b * sdWp_pid
+                + offs_row[:, None] * sdWp_o
+                + offs_col[None, :]
+            )
+            tl.store(
+                dWp_ptrs,
+                tl.zeros((BLOCK_OH, BLOCK_K), dtype=tl.float32),
+                mask=mask_row[:, None] & mask_col[None, :],
+            )
+        dbp_ptrs = dbh_partial_ptr + pid_b * sdbp_pid + offs_row
+        tl.store(
+            dbp_ptrs,
+            tl.zeros((BLOCK_OH,), dtype=tl.float32),
+            mask=mask_row,
+        )
+
     # Ping-pong: at each step t, we read from `read_ptr` and write the new
     # dh_acc into `write_ptr`, then swap.
     read_ptr = dh_a_ptr

@@ -186,14 +186,29 @@ def test_triton_backward_matches_pytorch(T: int, B: int, IN: int, H: int) -> Non
     # Compare scalar loss (forward parity already tested elsewhere).
     assert abs(loss.item() - ref_loss.item()) / max(abs(ref_loss.item()), 1.0) < 1e-2
 
-    # Compare gradients on x, h0, and the hidden weights.
+    # Reconstruct the reference dWh_cat / dbh_cat by concatenating the
+    # per-gate cell weight grads in the same order that quantize_weights()
+    # builds Wh_cat (r, z, n along axis 0).
+    ref_dWh_cat = torch.cat(
+        [ref_layer.cell.W_hr.grad, ref_layer.cell.W_hz.grad, ref_layer.cell.W_hn.grad],
+        dim=0,
+    )
+    ref_dbh_cat = torch.cat(
+        [ref_layer.cell.b_hr.grad, ref_layer.cell.b_hz.grad, ref_layer.cell.b_hn.grad],
+        dim=0,
+    )
+
+    # Compare gradients on x, h0, the hidden weights, and the hidden bias.
+    # dWh_cat / dbh_cat parity catches a class of autotune-related bugs in the
+    # backward kernel where the partial-accumulator buffer is reused across
+    # trial configs without being zeroed (regression test for the fix in
+    # gru_scan_bwd_kernel that zeros the per-program slab on entry).
     for name, ref_g, tri_g in [
         ("x", ref_x.grad, tri_x.grad),
         ("h0", ref_h0.grad, tri_h0.grad),
-        ("Wh_cat", ref_layer.cell.W_hr.grad, None),  # only sanity-check existence
+        ("Wh_cat", ref_dWh_cat, Wh_cat.grad),
+        ("bh_cat", ref_dbh_cat, bh_cat.grad),
     ]:
-        if name == "Wh_cat":
-            continue  # ref Wh grad lives in the cell; weight parity covered separately
         assert ref_g is not None and tri_g is not None
         max_diff = (ref_g - tri_g).abs().max().item()
         rel = max_diff / max(ref_g.abs().max().item(), 1e-6)
