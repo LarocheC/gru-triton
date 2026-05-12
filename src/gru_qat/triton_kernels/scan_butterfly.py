@@ -199,6 +199,10 @@ def gru_scan_butterfly_fwd_kernel(
     offs_h = tl.arange(0, H_PAD)
     mask_h = offs_h < H
     mask_bh = mask_b[:, None] & mask_h[None, :]
+    # Local batch index for indexing into this program's scratch slab.
+    # `offs_b` is the absolute batch index (into h0/out/gi); scratch is
+    # laid out per-program with shape [BLOCK_B, H_PAD] so use local_b.
+    local_b = tl.arange(0, BLOCK_B)
 
     # Pre-load bias per gate; padded lanes = 0 so they contribute 0
     # additively in the recurrence.
@@ -233,7 +237,7 @@ def gru_scan_butterfly_fwd_kernel(
         for g in range(3):
             scr_g = scr_base + g * sscr_buf
             tl.store(
-                scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
+                scr_g + local_b[:, None] * sscr_b + offs_h[None, :],
                 h_self_q,
                 mask=mask_b[:, None],
             )
@@ -259,11 +263,11 @@ def gru_scan_butterfly_fwd_kernel(
                 for g in range(3):
                     scr_g = scr_base + g * sscr_buf
                     a = tl.load(
-                        scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
+                        scr_g + local_b[:, None] * sscr_b + offs_h[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
                     b = tl.load(
-                        scr_g + offs_b[:, None] * sscr_b + partner[None, :],
+                        scr_g + local_b[:, None] * sscr_b + partner[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
                     # Twiddle indexing: t[g, blk, s, pair_idx, m_new, m_old].
@@ -281,7 +285,7 @@ def gru_scan_butterfly_fwd_kernel(
                     t_sp = tl.load(twiddle_ptr + t_offset + (1 - member) * st_m_old)
                     new_val = t_ss[None, :] * a + t_sp[None, :] * b
                     tl.store(
-                        scr_g + offs_b[:, None] * sscr_b + offs_h[None, :],
+                        scr_g + local_b[:, None] * sscr_b + offs_h[None, :],
                         new_val,
                         mask=mask_b[:, None],
                     )
@@ -292,15 +296,15 @@ def gru_scan_butterfly_fwd_kernel(
         scr_z = scr_base + 1 * sscr_buf
         scr_n = scr_base + 2 * sscr_buf
         gh_r = tl.load(
-            scr_r + offs_b[:, None] * sscr_b + offs_h[None, :],
+            scr_r + local_b[:, None] * sscr_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         ) + bhr[None, :]
         gh_z = tl.load(
-            scr_z + offs_b[:, None] * sscr_b + offs_h[None, :],
+            scr_z + local_b[:, None] * sscr_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         ) + bhz[None, :]
         gh_n = tl.load(
-            scr_n + offs_b[:, None] * sscr_b + offs_h[None, :],
+            scr_n + local_b[:, None] * sscr_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         ) + bhn[None, :]
 
@@ -484,6 +488,9 @@ def gru_scan_butterfly_bwd_kernel(
     offs_h = tl.arange(0, H_PAD)
     mask_h = offs_h < H
     mask_bh = mask_b[:, None] & mask_h[None, :]
+    # Local batch index for indexing into this program's per-program slabs
+    # (state). dh_acc is global [B, H] and uses absolute offs_b.
+    local_b = tl.arange(0, BLOCK_B)
 
     bhr = tl.load(bh_ptr + 0 * H + offs_h, mask=mask_h, other=0.0)  # noqa: F841
     bhz = tl.load(bh_ptr + 1 * H + offs_h, mask=mask_h, other=0.0)  # noqa: F841
@@ -529,7 +536,7 @@ def gru_scan_butterfly_bwd_kernel(
         for g in range(3):
             base_g = state_base + g * sst_g + 0 * sst_l
             tl.store(
-                base_g + offs_b[:, None] * sst_b + offs_h[None, :],
+                base_g + local_b[:, None] * sst_b + offs_h[None, :],
                 h_prev_q,
                 mask=mask_b[:, None],
             )
@@ -552,11 +559,11 @@ def gru_scan_butterfly_bwd_kernel(
                     in_base = state_base + g * sst_g + state_l_in * sst_l
                     out_base = state_base + g * sst_g + state_l_out * sst_l
                     a = tl.load(
-                        in_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        in_base + local_b[:, None] * sst_b + offs_h[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
                     b = tl.load(
-                        in_base + offs_b[:, None] * sst_b + partner[None, :],
+                        in_base + local_b[:, None] * sst_b + partner[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
                     t_offset = (
@@ -570,7 +577,7 @@ def gru_scan_butterfly_bwd_kernel(
                     t_sp = tl.load(twiddle_ptr + t_offset + (1 - member) * st_m_old)
                     new_val = t_ss[None, :] * a + t_sp[None, :] * b
                     tl.store(
-                        out_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        out_base + local_b[:, None] * sst_b + offs_h[None, :],
                         new_val,
                         mask=mask_b[:, None],
                     )
@@ -581,15 +588,15 @@ def gru_scan_butterfly_bwd_kernel(
         end_z = state_base + 1 * sst_g + final_l * sst_l
         end_n = state_base + 2 * sst_g + final_l * sst_l
         gh_r = tl.load(
-            end_r + offs_b[:, None] * sst_b + offs_h[None, :],
+            end_r + local_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         ) + bhr[None, :]
         gh_z = tl.load(
-            end_z + offs_b[:, None] * sst_b + offs_h[None, :],
+            end_z + local_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         ) + bhz[None, :]
         gh_n = tl.load(
-            end_n + offs_b[:, None] * sst_b + offs_h[None, :],
+            end_n + local_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         ) + bhn[None, :]
 
@@ -677,15 +684,15 @@ def gru_scan_butterfly_bwd_kernel(
         d_dst_z = state_base + 1 * sst_g + final_l * sst_l
         d_dst_n = state_base + 2 * sst_g + final_l * sst_l
         tl.store(
-            d_dst_r + offs_b[:, None] * sst_b + offs_h[None, :],
+            d_dst_r + local_b[:, None] * sst_b + offs_h[None, :],
             dgh_r, mask=mask_b[:, None],
         )
         tl.store(
-            d_dst_z + offs_b[:, None] * sst_b + offs_h[None, :],
+            d_dst_z + local_b[:, None] * sst_b + offs_h[None, :],
             dgh_z, mask=mask_b[:, None],
         )
         tl.store(
-            d_dst_n + offs_b[:, None] * sst_b + offs_h[None, :],
+            d_dst_n + local_b[:, None] * sst_b + offs_h[None, :],
             dgh_n, mask=mask_b[:, None],
         )
 
@@ -712,19 +719,19 @@ def gru_scan_butterfly_bwd_kernel(
                     old_base = state_base + g * sst_g + state_l_in * sst_l
 
                     d_self = tl.load(
-                        d_new_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        d_new_base + local_b[:, None] * sst_b + offs_h[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
                     d_partner = tl.load(
-                        d_new_base + offs_b[:, None] * sst_b + partner[None, :],
+                        d_new_base + local_b[:, None] * sst_b + partner[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
                     old_self = tl.load(
-                        old_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        old_base + local_b[:, None] * sst_b + offs_h[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
                     old_partner = tl.load(
-                        old_base + offs_b[:, None] * sst_b + partner[None, :],
+                        old_base + local_b[:, None] * sst_b + partner[None, :],
                         mask=mask_b[:, None], other=0.0,
                     )
 
@@ -743,7 +750,7 @@ def gru_scan_butterfly_bwd_kernel(
                     d_old = t_self[None, :] * d_self + t_partner[None, :] * d_partner
 
                     tl.store(
-                        old_base + offs_b[:, None] * sst_b + offs_h[None, :],
+                        old_base + local_b[:, None] * sst_b + offs_h[None, :],
                         d_old,
                         mask=mask_b[:, None],
                     )
@@ -856,15 +863,15 @@ def gru_scan_butterfly_bwd_kernel(
         # input). Sum across gates, then apply STE backward of
         # quant_h_in (zero where h_prev was clipped).
         dh_via_r = tl.load(
-            state_base + 0 * sst_g + 0 * sst_l + offs_b[:, None] * sst_b + offs_h[None, :],
+            state_base + 0 * sst_g + 0 * sst_l + local_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         )
         dh_via_z = tl.load(
-            state_base + 1 * sst_g + 0 * sst_l + offs_b[:, None] * sst_b + offs_h[None, :],
+            state_base + 1 * sst_g + 0 * sst_l + local_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         )
         dh_via_n = tl.load(
-            state_base + 2 * sst_g + 0 * sst_l + offs_b[:, None] * sst_b + offs_h[None, :],
+            state_base + 2 * sst_g + 0 * sst_l + local_b[:, None] * sst_b + offs_h[None, :],
             mask=mask_b[:, None], other=0.0,
         )
         dh_via = dh_via_r + dh_via_z + dh_via_n

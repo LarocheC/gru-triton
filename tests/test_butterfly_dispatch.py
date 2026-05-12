@@ -161,6 +161,60 @@ def test_butterfly_triton_forward_matches_per_step(T: int, B: int, H: int) -> No
 
 
 @cuda_only
+def test_butterfly_triton_forward_scratch_oob_regression() -> None:
+    """Regression for the scratch-OOB bug at large batch / hidden size.
+
+    The forward kernel previously indexed its per-program scratch slab
+    using absolute ``offs_b = pid_b * BLOCK_B + arange(BLOCK_B)`` instead
+    of local ``arange(BLOCK_B)``. For ``pid_b > 0`` that shifted scratch
+    writes by ``pid_b * BLOCK_B * H_PAD`` floats within the slab; for the
+    last program (e.g. pid_b=3 at B=32/BLOCK_B=8) two of its three gate
+    stores went past the slab end into whatever neighboring allocation
+    lived there. This manifested as silent corruption of nearby tensor
+    storages — typically ``rel_max > 1e3`` on bias gradients of any
+    layer that happened to live in the affected memory region.
+
+    The fix indexes scratch with ``local_b = arange(BLOCK_B)``. This
+    test exercises the (B=32, H=512) shape where the OOB was 8KB —
+    if it regresses, the per-batch output at batches 24..31 will
+    diverge by an order of magnitude from the per-step reference.
+    """
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+    T, B, H = 16, 32, 512
+    layer = _make_layer(H, use_triton=False).to(device).eval()
+    x = torch.randn(T, B, H, device=device) * 0.1
+    h0 = torch.randn(B, H, device=device) * 0.1
+
+    with torch.no_grad():
+        xq = layer.cell.quant_x(x)
+        Wi_cat, bi_cat = layer.cell.quantize_input_weights()
+        gi = torch.nn.functional.linear(xq, Wi_cat, bi_cat)
+        modules, bh_cat = extract_butterfly_factors(layer.cell)
+        ref_out = gru_scan_butterfly(gi, h0, modules, bh_cat)
+
+        twiddles, _ = extract_butterfly_twiddles(layer.cell)
+        tri_out = gru_scan_butterfly_forward_triton(gi, h0, twiddles, bh_cat)
+
+    # At H=512 the cuBLAS/torch_structured-butterfly vs Triton tl.dot TF32
+    # reduction-order drift accumulates to a few percent over T steps; the
+    # OOB-corruption bug was order ~1.0+ relative, so a 5% threshold cleanly
+    # distinguishes "fixed" from "regressed". Inspect per-batch maxes so a
+    # regression localized to the last program (pid_b=3, batches 24..31)
+    # surfaces clearly.
+    rel_per_b = (
+        (tri_out - ref_out).abs().amax(dim=(0, 2))
+        / ref_out.abs().amax().clamp(min=1e-6)
+    )
+    assert rel_per_b.max().item() < 5e-2, (
+        f"butterfly forward max per-batch rel diff {rel_per_b.max().item():.4e} "
+        f"exceeds 5e-2; worst batch={rel_per_b.argmax().item()}, "
+        f"rel by batch={rel_per_b.tolist()}"
+    )
+
+
+@cuda_only
 @pytest.mark.parametrize("T,B,H", [(4, 8, 16), (8, 16, 32), (8, 32, 64)])
 def test_butterfly_triton_backward_matches_autograd(T: int, B: int, H: int) -> None:
     """Triton butterfly backward must match autograd gradients through
@@ -183,11 +237,13 @@ def test_butterfly_triton_backward_matches_autograd(T: int, B: int, H: int) -> N
     gi_const = torch.nn.functional.linear(xq, Wi_cat, bi_cat).detach()
 
     # Reference: autograd through gru_scan_butterfly.
+    # twiddle shape: [nstacks=1, nblocks, log_n, n//2, 2, 2]. squeeze nstacks
+    # (kept in the kernel layout); nblocks is preserved.
     twiddles_ref = (
         torch.stack([
-            layer.cell.struct_Wh_r.b.twiddle.squeeze(0).squeeze(0).clone(),
-            layer.cell.struct_Wh_z.b.twiddle.squeeze(0).squeeze(0).clone(),
-            layer.cell.struct_Wh_n.b.twiddle.squeeze(0).squeeze(0).clone(),
+            layer.cell.struct_Wh_r.b.twiddle.squeeze(0).clone(),
+            layer.cell.struct_Wh_z.b.twiddle.squeeze(0).clone(),
+            layer.cell.struct_Wh_n.b.twiddle.squeeze(0).clone(),
         ], dim=0)
         .detach().requires_grad_()
     )
@@ -221,7 +277,8 @@ def test_butterfly_triton_backward_matches_autograd(T: int, B: int, H: int) -> N
             ghs = []
             for g in range(3):
                 # Reshape h to [B, 1, H] for butterfly_multiply (nstacks=1).
-                tw = twiddles[g].unsqueeze(0).unsqueeze(0)  # [1, 1, log_H, H/2, 2, 2]
+                # twiddles[g] is [nblocks, log_H, H/2, 2, 2]; add nstacks=1 axis.
+                tw = twiddles[g].unsqueeze(0)  # [1, nblocks, log_H, H/2, 2, 2]
                 gh_g = butterfly_multiply(tw, h.unsqueeze(1), True).squeeze(1) + bh3[g]
                 ghs.append(gh_g)
             gh_r, gh_z, gh_n = ghs
