@@ -19,7 +19,7 @@ tolerates TF32 noise at rel < 5e-3; strict tier eliminates that source of
 noise by setting ``'highest'`` and asserts < 1e-5 abs. If a
 ``(T, B, H, nblocks)`` combo fails strict-tier, that's a finding per D-14
 of ``02-CONTEXT.md`` — Commit A failing test -> bd issue -> Commit B fix
-in ``src/`` (no ``@pytest.mark.xfail`` per D-27).
+in ``src/`` (do NOT mark failures as expected-failures per D-27).
 
 Grid: parametrized over ``nblocks in {2, 4, 8}`` per D-16 with the
 divisibility filter ``H % nblocks == 0`` (Monarch requires H divisible by
@@ -41,6 +41,8 @@ torch_structured = pytest.importorskip("torch_structured")
 from gru_qat import GRULayer, QuantRecipe, QuantizerConfig, StructureConfig  # noqa: E402
 from gru_qat.triton_kernels.scan_monarch import (  # noqa: E402
     extract_monarch_factors,
+    gru_scan_monarch_backward_pytorch,
+    gru_scan_monarch_backward_triton,
     gru_scan_monarch_forward_pytorch,
     gru_scan_monarch_forward_triton,
 )
@@ -188,3 +190,100 @@ def test_monarch_fwd_strict_matches_reference_slow(
     assert max_diff < 1e-5, (
         f"max abs diff {max_diff:.4e} (T={T},B={B},H={H},nblocks={nblocks})"
     )
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H,nblocks", FAST_MONARCH_GRID)
+def test_monarch_bwd_strict_matches_reference(
+    T: int, B: int, H: int, nblocks: int
+) -> None:
+    """Triton monarch backward gradients must match the PyTorch monarch
+    reference on ``(dgi, dh0, dWh_struct, dbh)`` to < 1e-5 absolute under
+    ``'highest'`` precision.
+
+    The realistic-tier sibling at ``tests/test_triton_monarch.py:248``
+    uses ``< 5e-2`` rel under TF32 — that's correct for its regime; not
+    loosened by us. Per D-14: any failure here is a finding for Plan
+    02-06 GPU triage (Commit A failing test -> bd issue -> Commit B fix
+    in ``src/``; do NOT mark failures as expected-failures per D-27).
+
+    Compares directly via the kernel-pair signatures (not autograd) —
+    matches the analog file's pattern at
+    ``tests/test_triton_monarch.py:233-248``: both backward functions
+    return ``(dgi, dh0, dWh_struct, dbh)`` with shapes
+    ``([T, B, 3H], [B, H], [3, nblocks, blksz, blksz], [3H])`` per the
+    docstring at
+    ``src/gru_qat/triton_kernels/scan_monarch.py:928-934``.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    layer = _make_monarch_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
+
+    x = torch.randn(T, B, H, device=device)
+    h0 = torch.randn(B, H, device=device)
+
+    with torch.no_grad():
+        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        gi = _build_gi_from_cell(layer, x)
+        out_fwd = gru_scan_monarch_forward_pytorch(gi, h0, Wh_struct, bh_cat)
+        dout = torch.randn(T, B, H, device=device)
+
+        dgi_ref, dh0_ref, dWh_struct_ref, dbh_ref = gru_scan_monarch_backward_pytorch(
+            gi, h0, Wh_struct, bh_cat, out_fwd, dout
+        )
+        dgi_tri, dh0_tri, dWh_struct_tri, dbh_tri = gru_scan_monarch_backward_triton(
+            gi, h0, Wh_struct, bh_cat, out_fwd, dout
+        )
+
+    for name, ref_g, tri_g in [
+        ("dgi", dgi_ref, dgi_tri),
+        ("dh0", dh0_ref, dh0_tri),
+        ("dWh_struct", dWh_struct_ref, dWh_struct_tri),
+        ("dbh", dbh_ref, dbh_tri),
+    ]:
+        max_diff = (ref_g - tri_g).abs().max().item()
+        assert max_diff < 1e-5, (
+            f"{name} max abs diff {max_diff:.4e} "
+            f"(T={T},B={B},H={H},nblocks={nblocks})"
+        )
+
+
+@cuda_only
+@pytest.mark.slow
+@pytest.mark.parametrize("T,B,H,nblocks", SLOW_MONARCH_GRID)
+def test_monarch_bwd_strict_matches_reference_slow(
+    T: int, B: int, H: int, nblocks: int
+) -> None:
+    """Identical body to the fast variant; gated behind ``@pytest.mark.slow``
+    per D-16 (T in {512, 1024})."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    layer = _make_monarch_layer(in_size=H, hid=H, nblocks=nblocks).to(device).eval()
+
+    x = torch.randn(T, B, H, device=device)
+    h0 = torch.randn(B, H, device=device)
+
+    with torch.no_grad():
+        Wh_struct, bh_cat = extract_monarch_factors(layer.cell)
+        gi = _build_gi_from_cell(layer, x)
+        out_fwd = gru_scan_monarch_forward_pytorch(gi, h0, Wh_struct, bh_cat)
+        dout = torch.randn(T, B, H, device=device)
+
+        dgi_ref, dh0_ref, dWh_struct_ref, dbh_ref = gru_scan_monarch_backward_pytorch(
+            gi, h0, Wh_struct, bh_cat, out_fwd, dout
+        )
+        dgi_tri, dh0_tri, dWh_struct_tri, dbh_tri = gru_scan_monarch_backward_triton(
+            gi, h0, Wh_struct, bh_cat, out_fwd, dout
+        )
+
+    for name, ref_g, tri_g in [
+        ("dgi", dgi_ref, dgi_tri),
+        ("dh0", dh0_ref, dh0_tri),
+        ("dWh_struct", dWh_struct_ref, dWh_struct_tri),
+        ("dbh", dbh_ref, dbh_tri),
+    ]:
+        max_diff = (ref_g - tri_g).abs().max().item()
+        assert max_diff < 1e-5, (
+            f"{name} max abs diff {max_diff:.4e} "
+            f"(T={T},B={B},H={H},nblocks={nblocks})"
+        )
