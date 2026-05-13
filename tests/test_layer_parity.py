@@ -18,7 +18,6 @@ conditions) — that's intentional. Cell-level parity at < 1e-5 is pinned by
 
 from __future__ import annotations
 
-import pytest  # noqa: F401  # used by tests added in Task 2 of this plan
 import torch
 import torch.nn as nn
 
@@ -132,3 +131,165 @@ def _translate_nn_gru_to_cell(gru: nn.GRU) -> GRULayer:
         cell.b_hz.copy_(bhz)
         cell.b_hn.copy_(bhn)
     return layer
+
+
+# ----------------------------------------------------------------------------
+# Gate-ordering / n-gate-asymmetry micro-tests (Plan 01-01, Task 2; D-04)
+# ----------------------------------------------------------------------------
+#
+# These three tests are NOT parametrized — they are one-shot smoke tests run
+# BEFORE the 75-combo grid (which lives in Plan 02). If any of these fail, the
+# helper is compensating for a real cell-math bug that the grid would mask;
+# they isolate the assumption that gate order is (r, z, n) on both sides and
+# that the n-gate's r_t multiplier is applied only to the hidden contribution.
+#
+# Tolerance: < 1e-4 using the relative-error idiom from
+# tests/test_triton_diagonal.py:120-121. The 1e-6 floor on the denominator is
+# non-negotiable — prevents division by near-zero on degenerate cases.
+
+
+def test_gate_order_r_only() -> None:
+    """Set W_ir=ones, W_iz=W_in=zeros (all hidden weights and biases zero);
+    nn.GRU and ours must agree that only the r-gate's sigmoid fires.
+
+    If the cell's gate order is wrong (e.g. (z, r, n) instead of (r, z, n)),
+    the grid tests will still pass because the translation helper would
+    compensate. This micro-test isolates the gate-order assumption by
+    activating only the r-gate.
+    """
+    torch.manual_seed(0)
+    layer = _make_dense_fp32_layer(input_size=4, hidden_size=4)
+    cell = layer.cell
+    with torch.no_grad():
+        cell.W_ir.fill_(1.0)
+        cell.W_iz.zero_()
+        cell.W_in.zero_()
+        cell.W_hr.zero_()
+        cell.W_hz.zero_()
+        cell.W_hn.zero_()
+        for b in (cell.b_ir, cell.b_iz, cell.b_in, cell.b_hr, cell.b_hz, cell.b_hn):
+            b.zero_()
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(1, 2, 4)  # [T=1, B=2, IN=4]
+    h0 = torch.zeros(2, 4)  # [B=2, H=4]
+    out_ref, _ = gru(x, h0.unsqueeze(0))
+    out_ours, _ = layer(x, h0)
+
+    max_diff = (out_ref - out_ours).abs().max().item()
+    rel = max_diff / max(out_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, (
+        f"r-only rel diff {rel:.4e} "
+        f"(out_ref.shape={tuple(out_ref.shape)}, out_ours.shape={tuple(out_ours.shape)})"
+    )
+
+
+def test_gate_order_z_only() -> None:
+    """Set W_iz=ones, W_ir=W_in=zeros (all hidden weights and biases zero);
+    nn.GRU and ours must agree that only the z-gate's sigmoid fires.
+
+    Companion to ``test_gate_order_r_only`` — swaps which input-side gate is
+    active. Together the two tests pin the order of W_ir vs W_iz in the
+    translation helper.
+    """
+    torch.manual_seed(0)
+    layer = _make_dense_fp32_layer(input_size=4, hidden_size=4)
+    cell = layer.cell
+    with torch.no_grad():
+        cell.W_ir.zero_()
+        cell.W_iz.fill_(1.0)
+        cell.W_in.zero_()
+        cell.W_hr.zero_()
+        cell.W_hz.zero_()
+        cell.W_hn.zero_()
+        for b in (cell.b_ir, cell.b_iz, cell.b_in, cell.b_hr, cell.b_hz, cell.b_hn):
+            b.zero_()
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(1, 2, 4)
+    h0 = torch.zeros(2, 4)
+    out_ref, _ = gru(x, h0.unsqueeze(0))
+    out_ours, _ = layer(x, h0)
+
+    max_diff = (out_ref - out_ours).abs().max().item()
+    rel = max_diff / max(out_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, (
+        f"z-only rel diff {rel:.4e} "
+        f"(out_ref.shape={tuple(out_ref.shape)}, out_ours.shape={tuple(out_ours.shape)})"
+    )
+
+
+def test_n_gate_asymmetry() -> None:
+    """Force ``r ~ 0`` by setting ``b_ir`` to large-negative; the n-gate must
+    reduce to ``tanh(W_in x + b_in)`` (without the ``r * (W_hn h + b_hn)``
+    contribution).
+
+    Both nn.GRU and our cell must agree on the asymmetric placement of r
+    inside the tanh — see src/gru_qat/gru_cell.py:11-14 module docstring.
+    Many home-grown GRU implementations apply r to the whole n-gate
+    pre-activation (including the input branch) and silently lose 1-2%
+    accuracy. This test isolates that asymmetry: with r squashed to ~0 by
+    the strong negative bias, the only path that produces the correct output
+    is the asymmetric one. Note that W_in, W_hn, b_in, b_hn are kept at their
+    initialized values on purpose — we want a non-trivial n-gate
+    contribution from the input branch to verify it survives intact.
+    """
+    torch.manual_seed(0)
+    layer = _make_dense_fp32_layer(input_size=4, hidden_size=4)
+    cell = layer.cell
+    with torch.no_grad():
+        # Squash r to ~0: zero W_ir so x doesn't drive r, and slam b_ir
+        # large-negative so sigmoid(gate_r) -> 0 regardless of h.
+        cell.W_ir.zero_()
+        cell.W_hr.zero_()
+        cell.b_ir.fill_(-100.0)
+        cell.b_hr.zero_()
+        # W_in, W_hn, b_in, b_hn stay at their init values — that's the
+        # whole point of the test.
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(1, 2, 4)
+    h0 = torch.zeros(2, 4)
+    out_ref, _ = gru(x, h0.unsqueeze(0))
+    out_ours, _ = layer(x, h0)
+
+    max_diff = (out_ref - out_ours).abs().max().item()
+    rel = max_diff / max(out_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, (
+        f"n-gate-asymmetry rel diff {rel:.4e} "
+        f"(out_ref.shape={tuple(out_ref.shape)}, out_ours.shape={tuple(out_ours.shape)})"
+    )
+
+
+# ----------------------------------------------------------------------------
+# Round-trip smoke test (Plan 01-01, Task 2; D-01)
+# ----------------------------------------------------------------------------
+
+
+def test_round_trip_nn_gru_to_cell() -> None:
+    """Build an nn.GRU first, copy its weights into a fresh GRULayer via the
+    inverse helper, then assert layer outputs match.
+
+    Catches bugs in ``_translate_nn_gru_to_cell`` itself before any
+    parametrized grid runs. The grid in Plan 02 uses the cell-to-nn.GRU
+    direction; this one-shot test exercises the opposite direction so a bug
+    in the inverse helper surfaces here rather than silently passing the
+    grid (where it would never be called).
+    """
+    torch.manual_seed(0)
+    gru = nn.GRU(8, 16, num_layers=1, bidirectional=False, batch_first=False)
+    layer = _translate_nn_gru_to_cell(gru)
+
+    x = torch.randn(7, 4, 8)  # [T=7, B=4, IN=8]
+    h0_3d = torch.zeros(1, 4, 16)  # nn.GRU expects [num_layers, B, H]
+
+    out_ref, hT_ref = gru(x, h0_3d)
+    out_ours, hT_ours = layer(x, h0_3d.squeeze(0))
+
+    max_diff = (out_ref - out_ours).abs().max().item()
+    rel = max_diff / max(out_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, f"round-trip out rel diff {rel:.4e}"
+
+    max_diff_h = (hT_ref.squeeze(0) - hT_ours).abs().max().item()
+    rel_h = max_diff_h / max(hT_ref.abs().max().item(), 1e-6)
+    assert rel_h < 1e-4, f"round-trip h_T rel diff {rel_h:.4e}"
