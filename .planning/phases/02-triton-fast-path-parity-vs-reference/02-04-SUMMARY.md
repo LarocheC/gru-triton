@@ -88,11 +88,13 @@ _Note: Both tasks were authored TDD-style — the failing assertion bounds were 
 
 ## Deviations from Plan
 
-None of the deviation rules (Rules 1-4) fired. The plan was executed exactly as written, with one minor variance:
-
 ### Minor variance (within "Claude's Discretion" per CONTEXT)
 
 - **One bwd helper function (`_assert_grad_close`).** Not in the plan's `<action>` block, which inlines the assertion logic. This is a read-and-write-time refactoring decision under "Claude's discretion" per CONTEXT D-26 / CONVENTIONS — the plan's intent (per-named-grad failure messages) is preserved exactly; the helper just avoids duplication between the fast and slow bwd tests.
+
+### Parallel-execution race condition (not a Rule 1-4 deviation; documented for transparency)
+
+- **`tests/test_triton_scan_strict.py` got bundled into this plan's metadata commit (`5bddd4a`).** That file is the parallel scan-strict agent's work; this plan's `git add` specified only `.planning/phases/02-triton-fast-path-parity-vs-reference/02-04-SUMMARY.md`, but a concurrent agent had created the untracked scan_strict file in the shared working tree and the `git commit` swept it in (likely a parallel-add / commit-order race — see reflog: parallel agents performed multiple resets in the same window). The file content is the parallel agent's intended work and is correct; only the attribution shifted. **No corrective rewrite was attempted** because (a) the working tree end-state matches the intended end-state, and (b) destructive history rewrites (`git reset --hard`, `git rebase`) are prohibited by the agent's destructive-git rules. The scan-strict agent's plan summary (`02-01-SUMMARY.md`, when it lands) can reference commit `5bddd4a` as the file's add-commit.
 
 ## Initial Findings (deferred to Plan 02-06)
 
