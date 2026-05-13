@@ -28,7 +28,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-StructuredKind = Literal["dense", "monarch", "circulant", "butterfly", "ldr"]
+StructuredKind = Literal["dense", "diagonal", "monarch", "circulant", "butterfly", "ldr"]
 
 
 @dataclass
@@ -74,7 +74,13 @@ def _is_pow2(n: int) -> bool:
 
 
 def _validate_shapes(kind: StructuredKind, in_features: int, out_features: int, cfg: StructureConfig) -> None:
-    if kind == "monarch":
+    if kind == "diagonal":
+        if in_features != out_features:
+            raise ValueError(
+                f"diagonal requires square (in == out); "
+                f"got in={in_features}, out={out_features}"
+            )
+    elif kind == "monarch":
         if in_features % cfg.nblocks != 0 or out_features % cfg.nblocks != 0:
             raise ValueError(
                 f"monarch requires in/out divisible by nblocks={cfg.nblocks}; "
@@ -128,6 +134,9 @@ def make_structured_linear(
 
     _validate_shapes(cfg.kind, in_features, out_features, cfg)
 
+    if cfg.kind == "diagonal":
+        return _DiagonalLinear(in_features, bias=bias)
+
     if cfg.kind == "monarch":
         ts = _import_torch_structured()
         return ts.monarch.blockdiag_linear.BlockdiagLinear(
@@ -163,6 +172,36 @@ def make_structured_linear(
         )
 
     raise ValueError(f"unknown structured kind: {cfg.kind!r}")
+
+
+class _DiagonalLinear(nn.Module):
+    """Square diagonal: y = x * w (elementwise), optionally + bias.
+
+    Holds a single length-`n` parameter; equivalent to a dense linear whose
+    weight is `diag(w)`. O(n) params and FLOPs vs O(n^2) for dense.
+    """
+
+    def __init__(self, n: int, *, bias: bool = False) -> None:
+        super().__init__()
+        self.n = n
+        self.weight = nn.Parameter(torch.empty(n))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(n))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # Match nn.Linear's per-output-row init scale: U(-k, k) with
+        # k = 1/sqrt(in_features), which here equals 1/sqrt(n).
+        k = self.n**-0.5
+        nn.init.uniform_(self.weight, -k, k)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = x * self.weight
+        if self.bias is not None:
+            y = y + self.bias
+        return y
 
 
 class _CirculantLinear(nn.Module):

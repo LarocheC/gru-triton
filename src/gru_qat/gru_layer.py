@@ -86,7 +86,10 @@ class GRULayer(nn.Module):
 
         # Fast-path dispatch eligibility: input must be dense, gate
         # layout must be 'fused' (so the input projection produces a
-        # [T, B, 3H] tensor), and the hidden side must be either:
+        # [T, B, 3H] tensor), and the hidden side must be one of:
+        # - "diagonal": uses a persistent Triton kernel; the recurrence
+        #   is fully pointwise across H so each program owns a slab and
+        #   needs no cross-CTA barrier.
         # - "monarch": uses the persistent Triton kernel (real speedup).
         # - "butterfly": uses a Python time loop calling
         #   torch_structured.butterfly_multiply per step (API parity,
@@ -96,7 +99,7 @@ class GRULayer(nn.Module):
         kind = structure_hidden.kind if structure_hidden is not None else None
         self._fast_dispatch_eligible = (
             structure_input is None
-            and kind in ("monarch", "butterfly")
+            and kind in ("diagonal", "monarch", "butterfly")
             and gate_layout == "fused"
         )
         self._dispatch_kind: str | None = kind if self._fast_dispatch_eligible else None
@@ -107,7 +110,7 @@ class GRULayer(nn.Module):
             if self.use_triton and not self._fast_dispatch_eligible:
                 raise ValueError(
                     "use_triton=True requires structure_input=None, "
-                    "structure_hidden.kind in {'monarch', 'butterfly'}, "
+                    "structure_hidden.kind in {'diagonal', 'monarch', 'butterfly'}, "
                     "and gate_layout='fused'."
                 )
         # When compile_step is True, wrap the per-step body in torch.compile
@@ -214,7 +217,17 @@ class GRULayer(nn.Module):
         h_in_q = _extract_h_quant_params(self.cell.quant_h_in)
         h_out_q = _extract_h_quant_params(self.cell.quant_h_out)
 
-        if self._dispatch_kind == "monarch":
+        if self._dispatch_kind == "diagonal":
+            from gru_qat.triton_kernels.scan_diagonal import (
+                extract_diagonal_factors,
+                gru_scan_diagonal,
+            )
+            Wh_diag, bh_cat = extract_diagonal_factors(self.cell)
+            out = gru_scan_diagonal(
+                gi, h0, Wh_diag, bh_cat,
+                h_in_quant=h_in_q, h_out_quant=h_out_q,
+            )
+        elif self._dispatch_kind == "monarch":
             from gru_qat.triton_kernels.scan_monarch import (
                 extract_monarch_factors,
                 gru_scan_monarch,
