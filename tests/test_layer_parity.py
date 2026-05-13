@@ -18,6 +18,7 @@ conditions) — that's intentional. Cell-level parity at < 1e-5 is pinned by
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -293,3 +294,94 @@ def test_round_trip_nn_gru_to_cell() -> None:
     max_diff_h = (hT_ref.squeeze(0) - hT_ours).abs().max().item()
     rel_h = max_diff_h / max(hT_ref.abs().max().item(), 1e-6)
     assert rel_h < 1e-4, f"round-trip h_T rel diff {rel_h:.4e}"
+
+
+# ----------------------------------------------------------------------------
+# Grid constants for the 75-combo parity grid (Plan 01-02; D-08)
+# ----------------------------------------------------------------------------
+#
+# The full grid is T x B x H = 5 x 3 x 5 = 75 combinations, split into
+# FAST_GRID (T in {1, 8, 64}; 45 cases) which runs on every `pytest -q`
+# invocation, and SLOW_GRID (T in {512, 1024}; 30 cases) which is gated
+# behind `@pytest.mark.slow` and only runs under `pytest -m slow`. The
+# B/H grid stays full on both sides per CONTEXT.md D-08.
+
+# Fast grid: T in {1, 8, 64}. Runs on every `pytest -q` invocation.
+# 3 x 3 x 5 = 45 cases per family (D-08).
+FAST_GRID: list[tuple[int, int, int]] = [
+    (T, B, H)
+    for T in (1, 8, 64)
+    for B in (1, 4, 32)
+    for H in (1, 2, 8, 64, 512)
+]
+# Slow grid: T in {512, 1024}. Runs only under `pytest -m slow`.
+# 2 x 3 x 5 = 30 cases per family (D-08).
+SLOW_GRID: list[tuple[int, int, int]] = [
+    (T, B, H)
+    for T in (512, 1024)
+    for B in (1, 4, 32)
+    for H in (1, 2, 8, 64, 512)
+]
+
+
+# ----------------------------------------------------------------------------
+# Forward-output parity tests (Plan 01-02, Task 1; REF-01)
+# ----------------------------------------------------------------------------
+#
+# Test family split per D-09: forward-output parity is its OWN parametrized
+# function (and OWN _slow sibling), distinct from h_T parity. If the forward
+# output drifts but h_T is fine, the bug is in the per-step output write or
+# in the time-loop's `outputs.append(h)` ordering; if h_T drifts but forward
+# is fine, the bug is in the final-step or in the return-tuple's second
+# element. Fusing the two assertions into one function would lose that
+# diagnostic signal.
+
+
+@pytest.mark.parametrize("T,B,H", FAST_GRID)
+def test_layer_forward_matches_nn_gru(T: int, B: int, H: int) -> None:
+    """Forward output parity vs torch.nn.GRU across the fast grid (T in {1,8,64}).
+
+    Uses the cell -> nn.GRU translation helper from Plan 01-01. Both
+    implementations get ``h0=None`` (default zero-h0); the h0 != 0 case is
+    Plan 01-04's territory. Relative-error idiom with the 1e-6 denominator
+    floor and 1e-4 tolerance — see TESTING.md "Relative-error reporting"
+    and PATTERNS.md "Core parity-test body pattern".
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)  # keep input_size tied to H so the grid stays compact
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(T, B, IN)
+    out_ref, _ = gru(x)
+    out_ours, _ = layer(x)
+
+    max_diff = (out_ref - out_ours).abs().max().item()
+    rel = max_diff / max(out_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, f"out rel diff {rel:.4e} (T={T},B={B},H={H})"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("T,B,H", SLOW_GRID)
+def test_layer_forward_matches_nn_gru_slow(T: int, B: int, H: int) -> None:
+    """Forward output parity vs torch.nn.GRU across the slow grid (T in {512, 1024}).
+
+    Identical body to the fast variant; gated behind ``@pytest.mark.slow``
+    so default ``pytest -q`` doesn't pay the long-T cost. Same 1e-4
+    relative tolerance — long sequences shouldn't accumulate drift past
+    that under ``set_float32_matmul_precision('highest')``.
+    """
+    torch.manual_seed(0)
+    IN = max(H, 1)
+
+    layer = _make_dense_fp32_layer(IN, H)
+    gru = _translate_cell_to_nn_gru(layer)
+
+    x = torch.randn(T, B, IN)
+    out_ref, _ = gru(x)
+    out_ours, _ = layer(x)
+
+    max_diff = (out_ref - out_ours).abs().max().item()
+    rel = max_diff / max(out_ref.abs().max().item(), 1e-6)
+    assert rel < 1e-4, f"out rel diff {rel:.4e} (T={T},B={B},H={H})"
