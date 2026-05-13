@@ -27,7 +27,7 @@ src/gru_qat/
   quantizers.py           FakeQuantize base + per-tensor / per-channel / per-group
   calibration.py          calibrate(module, loader, n_batches), freeze_all
   structure.py            StructureConfig + make_structured_linear
-                          (Monarch, Circulant, Butterfly, LDR)
+                          (Diagonal, Monarch, Circulant, Butterfly, LDR)
   gru_cell.py             GRUCellQuant — single step. Optionally structured
                           (structure_input / structure_hidden).
   gru_layer.py            GRULayer — multi-step. Triton dispatch via use_triton.
@@ -35,6 +35,8 @@ src/gru_qat/
     __init__.py           Phase 5 design notes
     scan.py               Dense persistent fwd+bwd kernels (Monarch tier 2 sibling).
                           Autotune over BLOCK_B/OH/K. In-kernel fake-quant for QAT.
+    scan_diagonal.py      Diagonal persistent fwd+bwd. Elementwise w_h*h per gate;
+                          no matmul, no cross-CTA barrier. In-kernel fake-quant.
     scan_monarch.py       Monarch persistent fwd+bwd. nblocks block-diagonal matmuls
                           per timestep. In-kernel fake-quant for QAT.
     scan_butterfly.py     Butterfly persistent fwd+bwd. log_H stages of strided
@@ -49,6 +51,7 @@ tests/
   test_structure.py              Structured cells (all 4 kinds): forward,
                                  gradient flow, training, int8 QAT
   test_triton_scan.py            Dense Triton fwd+bwd + persistent + QAT
+  test_triton_diagonal.py        Diagonal Triton fwd+bwd + QAT + GRULayer dispatch
   test_triton_monarch.py         Monarch Triton fwd+bwd + QAT + GRULayer dispatch
   test_butterfly_dispatch.py     Butterfly Triton fwd+bwd + QAT + GRULayer dispatch
 
@@ -122,6 +125,7 @@ half across all T timesteps):
 | kernel | layout | parallelism | notes |
 |---|---|---|---|
 | `scan.py` (dense) | autotune + persistent | grid `(B_tile, OH_tile)` with spin-wait barrier | Both autotune (1D grid, no inter-CTA) and persistent (2D grid + barrier) variants. QAT support. |
+| `scan_diagonal.py` | persistent, no barrier | grid `(B_tile, H_tile)`, no cross-CTA sync | Elementwise hidden recurrence (no matmul) so each program owns its slab; `h` carries in registers. Smallest params, fastest variant. QAT support. |
 | `scan_monarch.py` | persistent | grid `(B_tile, block)` | One small `[blksz, blksz]` matmul per (block, gate). Best speed at typical training shapes. QAT support. |
 | `scan_butterfly.py` | persistent | grid `(B_tile,)` | log_H stages of strided 2×2 mixing per gate. No tensor-core utilization. QAT support. |
 
@@ -138,8 +142,8 @@ for cross-CTA data visibility — caused non-deterministic ~0.2 absolute
 drift on `gru_scan_persistent` outputs. Fixed in the most recent
 commits.
 
-- Tests: `test_triton_scan.py`, `test_triton_monarch.py`,
-  `test_butterfly_dispatch.py`.
+- Tests: `test_triton_scan.py`, `test_triton_diagonal.py`,
+  `test_triton_monarch.py`, `test_butterfly_dispatch.py`.
 
 ### Phase 5+ — structured-matrix hidden weights ✓
 
@@ -147,15 +151,15 @@ Extension to the phase-5 work, not part of the original plan:
 
 - `structure.py`: `StructureConfig(kind, nblocks, ...)` and
   `make_structured_linear` factory. Wraps `torch-structured`'s
-  primitives plus a thin Circulant via `torch.fft.rfft`.
+  primitives plus thin local Diagonal and Circulant layers.
 - Cell: optional `structure_input` / `structure_hidden`. Structured
   mode runs `step_structured` per timestep with the structured linear
   modules in place of dense weights. Per-gate output-side fake-quant
   replaces per-row weight quant.
-- Triton kernels for Monarch and Butterfly (Circulant / LDR fall back
-  to the per-step PyTorch path).
-- Tests: `test_structure.py`, `test_triton_monarch.py`,
-  `test_butterfly_dispatch.py`.
+- Triton kernels for Diagonal, Monarch and Butterfly (Circulant / LDR
+  fall back to the per-step PyTorch path).
+- Tests: `test_structure.py`, `test_triton_diagonal.py`,
+  `test_triton_monarch.py`, `test_butterfly_dispatch.py`.
 
 ### Phase 6 — int activations and LUT nonlinearities
 
@@ -172,6 +176,7 @@ Not started. Out of scope for QAT; needed for embedded deployment.
 | Monarch persistent, nblocks=8 | 2.0 | **0.45× (2.2× faster than cuDNN)** |
 | Butterfly persistent | 20.3 | 4.6× |
 | Butterfly per-step CUDA op (pre-Triton) | 107 | 24× |
+| Diagonal persistent | ~1.1 | **~0.25× (~4× faster than cuDNN)** |
 
 For QAT (frozen int8 hidden) add ~10–30% to the Triton numbers.
 
@@ -183,6 +188,7 @@ Per-gate hidden parameter counts:
 | Monarch nblocks=4 | 65K |
 | Monarch nblocks=8 | 32K |
 | Butterfly | 4.6K |
+| Diagonal | 512 |
 
 ## Upgrade pathways
 

@@ -10,10 +10,11 @@ hidden weights and a multi-step persistent Triton kernel.
   quantity is a `FakeQuantize` module that can be swapped without
   touching the cell code. Reference path is pure PyTorch; accelerated
   path is Triton.
-- **Plus**: hidden weights can be parameterized as Monarch
-  (block-diagonal), Butterfly (`O(H log H)` twiddle), Circulant, or
-  LDR (low-displacement rank) structured matrices, with matching
-  Triton kernels for Monarch and Butterfly.
+- **Plus**: hidden weights can be parameterized as Diagonal (one
+  vector per gate), Monarch (block-diagonal), Butterfly (`O(H log H)`
+  twiddle), Circulant, or LDR (low-displacement rank) structured
+  matrices, with matching Triton kernels for Diagonal, Monarch and
+  Butterfly.
 
 ## Read first
 
@@ -106,6 +107,29 @@ layer = GRULayer(
 # Same calibrate -> freeze -> forward flow.
 ```
 
+### Structured hidden weights — Diagonal (smallest & fastest)
+
+```python
+from gru_qat import GRULayer, StructureConfig
+
+layer = GRULayer(
+    H, H, recipe=...,
+    gate_layout="fused",
+    structure_hidden=StructureConfig(kind="diagonal"),
+    use_triton="auto",
+).cuda()
+# Same calibrate -> freeze -> forward flow.
+```
+
+`kind="diagonal"` collapses each `H*H` hidden matrix to a length-`H`
+vector. Per-step recurrence becomes elementwise `w_h * h` instead of a
+matmul — `3H` weight scalars total on the hidden side, `O(H)` FLOPs per
+step. The persistent Triton kernel has no matmul on the hidden side,
+no cross-program reduction, and runs fully in registers across the
+T-loop. Good fit when you want a *very* small recurrence (e.g. for an
+embedded model) and are happy treating the hidden update as
+hidden-unit-independent (similar in spirit to IndRNN / diagonal SSMs).
+
 ## Status
 
 All originally-planned phases (0–5) complete. The dense and structured
@@ -118,11 +142,12 @@ paths are feature-complete:
 | Fake-quant insertion in cell (all 6 weight + 3 activation points) | ✓ |
 | `GRULayer` with calibration → freeze flow | ✓ |
 | Triton multi-step persistent kernel (dense, fp32, fp32 + frozen int8 QAT) | ✓ |
-| Structured hidden weights (Monarch / Butterfly / Circulant / LDR) | ✓ |
+| Structured hidden weights (Diagonal / Monarch / Butterfly / Circulant / LDR) | ✓ |
+| Triton persistent kernel for Diagonal (fp32 + QAT) | ✓ |
 | Triton persistent kernel for Monarch (fp32 + QAT) | ✓ |
 | Triton persistent kernel for Butterfly (fp32 + QAT) | ✓ |
 
-101 tests pass, 1 skipped (the simulator-parity placeholder that's
+117 tests pass, 1 skipped (the simulator-parity placeholder that's
 deferred until the simulator is on `PYTHONPATH`).
 
 ## Train-step speed at `(T=64, B=32, H=512)` — fp32
@@ -135,6 +160,7 @@ deferred until the simulator is on `PYTHONPATH`).
 | **Monarch persistent (nblocks=4)** | **5.8** | **1.3×** |
 | **Monarch persistent (nblocks=8)** | **2.0** | **0.45× (2.2× faster)** |
 | Butterfly persistent | 20.3 | 4.6× |
+| **Diagonal persistent** | **~1.1** | **~0.25× (4× faster)** |
 
 For QAT (frozen int8 hidden), expect ~10–30% overhead on top of the
 fp32 number depending on path.
@@ -158,17 +184,26 @@ per-parameter `dWh` / twiddle / `b_h*` rel diff.
 | Monarch persistent, nb=8 | int8 QAT (hidden) | 8% | 5% | 8% | 3% |
 | Butterfly persistent | fp32 | 3e-2 | 3e-3 | 1e-3 | 2e-3 |
 | Butterfly persistent | int8 QAT (hidden) | 15% | 15% | 1% | 8% |
+| **Diagonal persistent** | **fp32** | **1e-6** | **4e-5** | **2e-7** | **2e-6** |
+| **Diagonal persistent** | **int8 QAT (hidden)** | **0** | **3e-5** | **2e-7** | **1e-6** |
 
-QAT rows show ~5–15% relative drift because each step's `round(x/scale)`
-flips at half-integer boundaries when `tl.dot`'s TF32 reduction order
-disagrees with cuBLAS by `O(scale)` — a single rounding flip per
-~100 positions, amplified by the recurrence over T=64 steps. Not a
-kernel bug: `torch.round` and `tl.extra.libdevice.rint` are bit-identical
-on the same fp32 input (verified across 1M values + half-integer
-perturbations). Forcing Triton to `input_precision="ieee"` would tighten
-the QAT rows to ~1e-3 at the cost of ~2-4× slower matmul; current
-choice is speed over bit-parity. The butterfly fp32 row's `3e-2` fwd
-is the same story (kernel TF32 vs `torch_structured`'s CUDA op).
+QAT rows for the matmul-based variants show ~5–15% relative drift
+because each step's `round(x/scale)` flips at half-integer boundaries
+when `tl.dot`'s TF32 reduction order disagrees with cuBLAS by
+`O(scale)` — a single rounding flip per ~100 positions, amplified by
+the recurrence over T=64 steps. Not a kernel bug: `torch.round` and
+`tl.extra.libdevice.rint` are bit-identical on the same fp32 input
+(verified across 1M values + half-integer perturbations). Forcing
+Triton to `input_precision="ieee"` would tighten the QAT rows to
+~1e-3 at the cost of ~2-4× slower matmul; current choice is speed
+over bit-parity. The butterfly fp32 row's `3e-2` fwd is the same
+story (kernel TF32 vs `torch_structured`'s CUDA op).
+
+The diagonal variant has *no matmul* on the hidden side, so it ducks
+this story entirely: every multiplication is elementwise and Triton
+emits the same FMA order as the PyTorch reference. The QAT fwd row is
+exactly bit-identical (rel diff = 0); fp32 and grad rows are at fp32
+machine precision (~1e-5 / ~1e-7).
 
 ## Layout
 
@@ -183,6 +218,7 @@ src/gru_qat/
   gru_layer.py            GRULayer (multi-step + Triton dispatch)
   triton_kernels/
     scan.py               dense persistent fwd+bwd kernels
+    scan_diagonal.py      Diagonal persistent fwd+bwd kernels
     scan_monarch.py       Monarch persistent fwd+bwd kernels
     scan_butterfly.py     Butterfly persistent fwd+bwd kernels
 ```
