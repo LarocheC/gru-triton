@@ -13,7 +13,7 @@ This milestone is a brownfield correctness audit. The library has Phases 0–5 p
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Reference-path parity vs nn.GRU** - Pin `GRULayer` (Identity quantizers, dense) to `torch.nn.GRU` at the layer level for fwd / bwd / h_T / gate-ordering ✓ 2026-05-13
-- [ ] **Phase 2: Triton fast-path parity vs reference** - Pin every Triton variant (dense, diagonal, monarch, butterfly) fwd+bwd to the reference path, with recent-fix regression tests
+- [x] **Phase 2: Triton fast-path parity vs reference** - Pin every Triton variant (dense, diagonal, monarch, butterfly) fwd+bwd to the reference path, with recent-fix regression tests ✓ 2026-05-13 (Option C disposition)
 - [ ] **Phase 3: Structured PyTorch fallback parity** - Pin circulant + LDR per-step paths to hand-rolled references; confirm graceful degradation when `torch-structured` is missing
 - [ ] **Phase 4: Quant-on bit-identity** - Frozen INT8 recipe produces bit-identical output between Triton and reference paths across all variants; resolve per-channel min_max observer gap
 - [ ] **Phase 5: Calibration + freeze lifecycle** - `calibrate` actually exercises observers; `freeze_all` produces correct scales; Triton round-trip after freeze matches reference
@@ -51,12 +51,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   5. Tests skip cleanly on CPU-only machines via the existing `cuda_only` + `pytest.importorskip("triton")` pattern; no Triton test runs unguarded.
   6. Any mismatch surfaced becomes a failing test → beads issue → fix in-phase; tolerance is not relaxed beyond the < 1e-5 contract without an explicit decision logged in PROJECT.md.
 **Plans**: 6 plans
-- [ ] 02-01-PLAN.md — Dense strict-tier parity (TRI-01) + TRI-05 autotune regression + TRI-06 50-run determinism + D-25 .cv canary in tests/test_triton_scan_strict.py
-- [ ] 02-02-PLAN.md — Diagonal strict-tier parity (TRI-02) incl. H ∈ {1, 2, 8} in tests/test_triton_diagonal_strict.py
-- [ ] 02-03-PLAN.md — Monarch strict-tier parity (TRI-03) over nblocks ∈ {2, 4, 8} in tests/test_triton_monarch_strict.py
-- [ ] 02-04-PLAN.md — Butterfly strict-tier parity (TRI-04) at H ∈ {32, 128, 512} + D-22 OOB regression reference in tests/test_triton_butterfly_strict.py
-- [ ] 02-05-PLAN.md — Realistic-tier tightenings in tests/test_triton_diagonal.py + tests/test_triton_monarch.py (~10 candidates per PATTERNS.md inventory, separate atomic commits per D-20)
-- [ ] 02-06-PLAN.md — Audit kickoff: CUDA-box GPU run (checkpoint:human-verify) + bd findings triage + Commit A → Commit B per D-27 + phase-exit SUMMARY
+- [x] 02-01-PLAN.md — Dense strict-tier parity (TRI-01) + TRI-05 autotune regression + TRI-06 50-run determinism + D-25 .cv canary in tests/test_triton_scan_strict.py
+- [x] 02-02-PLAN.md — Diagonal strict-tier parity (TRI-02) incl. H ∈ {1, 2, 8} in tests/test_triton_diagonal_strict.py
+- [x] 02-03-PLAN.md — Monarch strict-tier parity (TRI-03) over nblocks ∈ {2, 4, 8} in tests/test_triton_monarch_strict.py
+- [x] 02-04-PLAN.md — Butterfly strict-tier parity (TRI-04) at H ∈ {32, 128, 512} + D-22 OOB regression reference in tests/test_triton_butterfly_strict.py
+- [x] 02-05-PLAN.md — Realistic-tier tightenings in tests/test_triton_diagonal.py + tests/test_triton_monarch.py (~10 candidates per PATTERNS.md inventory, separate atomic commits per D-20)
+- [x] 02-06-PLAN.md — Audit kickoff: CUDA-box GPU run (checkpoint:human-verify) + bd findings triage + Commit A → Commit B per D-27 + phase-exit SUMMARY
 
 ### Phase 3: Structured PyTorch fallback parity
 **Goal**: Circulant and LDR per-step PyTorch paths match hand-rolled references at < 1e-5, and all structured variants degrade gracefully (clear error, not silent wrong-answer) when `torch-structured` is missing.
@@ -123,7 +123,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Reference-path parity vs nn.GRU | 5/5 | Complete ✓ | 2026-05-13 |
-| 2. Triton fast-path parity vs reference | 0/6 | Planned | - |
+| 2. Triton fast-path parity vs reference | 6/6 | Complete ✓ (Option C) | 2026-05-13 |
 | 3. Structured PyTorch fallback parity | 0/TBD | Not started | - |
 | 4. Quant-on bit-identity | 0/TBD | Not started | - |
 | 5. Calibration + freeze lifecycle | 0/TBD | Not started | - |

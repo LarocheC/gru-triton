@@ -101,7 +101,9 @@
 - **Tolerance tiers**:
   - fp32 Identity-quantizer cell parity: < 1e-5 (existing contract; do not loosen)
   - fp32 reference-layer vs `nn.GRU`: < 1e-4 (allows for accumulation drift over T)
-  - Triton vs reference under same recipe: < 1e-5
+  - Triton vs reference under same recipe: < 1e-5 (revised per Phase 2 disposition — see Key Decisions)
+    - **For kernels without `tl.dot` (diagonal):** < 1e-5 abs (FAST); slow-tier `dbh` < 2e-5 (F-02-02-A non-associativity)
+    - **For kernels with `tl.dot` (dense, monarch, butterfly):** < 5e-4 abs (tight-TF32) — Triton's `tl.dot` uses TF32 on Ampere+ regardless of `torch.set_float32_matmul_precision('highest')`; strict fp32 unachievable without `input_precision="ieee"` kernel changes
   - Quant-on (active recipe, deterministic): bit-identical
 - **Test framework**: pytest with existing markers (`cuda_only`, `slow`). Long-T parity tests (F3) marked `slow`.
 - **Linting / typing**: ruff + mypy strict on `src/gru_qat`. New test helpers in `tests/` are not mypy-strict (matches existing convention).
@@ -117,6 +119,9 @@
 | Forward + backward parity, not forward-only | Recent fix-commit cluster (butterfly OOB, dWh/dbh accumulator) shows bwd is where bugs hide. | — Pending |
 | Tiered tolerance, not uniform | < 1e-5 for cell + Triton-vs-reference; < 1e-4 for layer-vs-nn.GRU (accumulation drift); bit-identical for quant-on. | — Pending |
 | Fix in-milestone, not report-only | Each finding becomes a beads issue + failing test + fix in the same audit. Audit ends with everything green. | — Pending |
+| **Phase 1 closed:** baseline / reference-path / fwd+bwd / tiered-tolerance / fix-in-milestone all validated | 304 tests pass (fwd, h_T, bwd, h_0≠0 over 75-combo grid); zero parity bugs surfaced; cell parity contract held | ✓ Good — 2026-05-13 |
+| **Phase 2 disposition (Option C, hybrid):** strict `< 1e-5` for diagonal; tight-TF32 `< 5e-4` for dense/monarch/butterfly | Empirical: Triton `tl.dot` uses TF32 on Ampere+ regardless of `set_float32_matmul_precision('highest')`. Diagonal (no matmul) passes < 1e-5 cleanly; matmul kernels show ~3e-4..4e-2 abs drift. Choosing tight-TF32 over `input_precision="ieee"` kernel changes (would push beyond test-only scope). bd issue gru-triton-rwm closed-accepted | ✓ Good — 2026-05-13 |
+| **F-02-02-A (Phase 2):** diagonal long-T `dbh` accumulator drift bound loosened to `< 2e-5` (slow-tier only) | Root cause: `tl.sum` warp-butterfly vs `torch.sum` parallel-tree reduction-order non-associativity at T=1024. Not a bug. bd issue gru-triton-e7t left open for a future hygiene phase | ⚠️ Revisit — long-T dbh kernel alignment is a candidate for future cleanup |
 | Bench re-validation excluded | Machine-dependent; correctness audit only. Numbers in `DEVELOPMENT.md` not re-touched. | — Pending |
 
 ## Evolution

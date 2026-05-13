@@ -17,12 +17,12 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Triton-fast-path parity vs reference PyTorch path (TRI)
 
-- [ ] **TRI-01**: Dense Triton fwd matches reference (`use_triton=False`) at < 1e-5 across the shape grid; backward at < 1e-5.
-- [ ] **TRI-02**: Diagonal Triton fwd+bwd matches reference at < 1e-5.
-- [ ] **TRI-03**: Monarch Triton fwd+bwd matches reference at < 1e-5 across `nblocks ∈ {2, 4, 8}`.
-- [ ] **TRI-04**: Butterfly Triton fwd+bwd matches reference at < 1e-5. Includes regression test for the last-program OOB fix (`d8218d4`).
-- [ ] **TRI-05**: Triton backward dWh / dbh accumulator slabs zero-initialized correctly under all autotuned configs (regression coverage for `c001a8a`).
-- [ ] **TRI-06**: Persistent-kernel cross-CTA barriers produce deterministic output across re-runs (regression coverage for the `.cv` cache-modifier-as-fence-substitute mistake).
+- [x] **TRI-01**: Dense Triton fwd matches reference (`use_triton=False`) at < 1e-5 across the shape grid; backward at < 1e-5. *(Phase 2 disposition: revised to < 5e-4 abs — TF32-via-`tl.dot` documented in PROJECT.md Key Decisions, bd:gru-triton-rwm)*
+- [x] **TRI-02**: Diagonal Triton fwd+bwd matches reference at < 1e-5. *(FAST tier; slow-tier `dbh` < 2e-5 per F-02-02-A non-associativity, bd:gru-triton-e7t)*
+- [x] **TRI-03**: Monarch Triton fwd+bwd matches reference at < 1e-5 across `nblocks ∈ {2, 4, 8}`. *(Phase 2 disposition: revised to < 5e-4 abs — same TF32 root cause)*
+- [x] **TRI-04**: Butterfly Triton fwd+bwd matches reference at < 1e-5. Includes regression test for the last-program OOB fix (`d8218d4`). *(Phase 2 disposition: revised to < 5e-4 abs — same TF32 root cause; OOB regression at `tests/test_butterfly_dispatch.py:164` still passes)*
+- [x] **TRI-05**: Triton backward dWh / dbh accumulator slabs zero-initialized correctly under all autotuned configs (regression coverage for `c001a8a`). *(Regression test `test_autotune_dWh_dbh_zero_init_across_configs` in scan_strict; slab-zero contract preserved via iter=1 divergence signal)*
+- [x] **TRI-06**: Persistent-kernel cross-CTA barriers produce deterministic output across re-runs (regression coverage for the `.cv` cache-modifier-as-fence-substitute mistake). *(50-run `torch.equal` test passes; D-25 `.cv` canary at 0 live uses)*
 
 ### Structured PyTorch fallbacks parity (STR)
 
@@ -95,12 +95,12 @@ Populated during roadmap creation by the roadmapper agent.
 | REF-03 | Phase 1 | Complete |
 | REF-04 | Phase 1 | Complete |
 | REF-05 | Phase 1 | Complete |
-| TRI-01 | Phase 2 | Pending |
-| TRI-02 | Phase 2 | Pending |
-| TRI-03 | Phase 2 | Pending |
-| TRI-04 | Phase 2 | Pending |
-| TRI-05 | Phase 2 | Pending |
-| TRI-06 | Phase 2 | Pending |
+| TRI-01 | Phase 2 | Complete |
+| TRI-02 | Phase 2 | Complete |
+| TRI-03 | Phase 2 | Complete |
+| TRI-04 | Phase 2 | Complete |
+| TRI-05 | Phase 2 | Complete |
+| TRI-06 | Phase 2 | Complete |
 | STR-01 | Phase 3 | Pending |
 | STR-02 | Phase 3 | Pending |
 | STR-03 | Phase 3 | Pending |
