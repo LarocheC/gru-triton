@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: planning
+status: completed
 stopped_at: Phase 1 context gathered
-last_updated: "2026-05-13T13:52:05.086Z"
-last_activity: 2026-05-13 — Roadmap created, 28 v1 requirements mapped to 7 phases
+last_updated: "2026-05-13T18:04:39.063Z"
+last_activity: 2026-05-13 -- Phase 1 marked complete
 progress:
   total_phases: 7
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  completed_phases: 1
+  total_plans: 5
+  completed_plans: 5
+  percent: 14
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-13)
 
 **Core value:** Every code path that claims to compute a GRU must produce numerically equivalent output to `torch.nn.GRU` (under matched recipe), and any deviation must be a tested, documented, intentional one — not a silent drift.
-**Current focus:** Phase 1 — Reference-path parity vs nn.GRU
+**Current focus:** Phase 1 — reference-path-parity-vs-nn-gru
 
 ## Current Position
 
-Phase: 1 of 7 (Reference-path parity vs nn.GRU)
-Plan: 0 of TBD in current phase
-Status: Ready to plan
-Last activity: 2026-05-13 — Roadmap created, 28 v1 requirements mapped to 7 phases
+Phase: 1 — COMPLETE
+Plan: 1 of 5
+Status: Phase 1 complete
+Last activity: 2026-05-13 -- Phase 1 marked complete
 
 Progress: [░░░░░░░░░░] 0%
 

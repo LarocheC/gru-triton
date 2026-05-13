@@ -9,11 +9,11 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Reference-path parity vs torch.nn.GRU (REF)
 
-- [ ] **REF-01**: `GRULayer` (use_triton=False, Identity quantizers, dense) forward matches `torch.nn.GRU` (1 layer, unidirectional) to < 1e-4 over T ∈ {1, 8, 64, 512, 1024}, B ∈ {1, 4, 32}, H ∈ {1, 2, 8, 64, 512}.
-- [ ] **REF-02**: Same parity test family with `h_0 ≠ 0` (random initial state) at the same tolerance.
-- [ ] **REF-03**: `GRULayer` backward gradients (dW_ih, dW_hh, db_ih, db_hh, dx, dh_0) match `torch.nn.GRU` autograd to < 1e-4.
-- [ ] **REF-04**: Final hidden state `h_T` returned by `GRULayer` matches `torch.nn.GRU`'s `h_n` at < 1e-4.
-- [ ] **REF-05**: Gate-ordering / bias-fusion alignment with `torch.nn.GRU` is documented in code + a translation helper exists in tests (or the divergence is explicitly tested and flagged).
+- [x] **REF-01**: `GRULayer` (use_triton=False, Identity quantizers, dense) forward matches `torch.nn.GRU` (1 layer, unidirectional) to < 1e-4 over T ∈ {1, 8, 64, 512, 1024}, B ∈ {1, 4, 32}, H ∈ {1, 2, 8, 64, 512}.
+- [x] **REF-02**: Same parity test family with `h_0 ≠ 0` (random initial state) at the same tolerance.
+- [x] **REF-03**: `GRULayer` backward gradients (dW_ih, dW_hh, db_ih, db_hh, dx, dh_0) match `torch.nn.GRU` autograd to < 1e-4.
+- [x] **REF-04**: Final hidden state `h_T` returned by `GRULayer` matches `torch.nn.GRU`'s `h_n` at < 1e-4.
+- [x] **REF-05**: Gate-ordering / bias-fusion alignment with `torch.nn.GRU` is documented in code + a translation helper exists in tests (or the divergence is explicitly tested and flagged).
 
 ### Triton-fast-path parity vs reference PyTorch path (TRI)
 
@@ -90,11 +90,11 @@ Populated during roadmap creation by the roadmapper agent.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REF-01 | Phase 1 | Pending |
-| REF-02 | Phase 1 | Pending |
-| REF-03 | Phase 1 | Pending |
-| REF-04 | Phase 1 | Pending |
-| REF-05 | Phase 1 | Pending |
+| REF-01 | Phase 1 | Complete |
+| REF-02 | Phase 1 | Complete |
+| REF-03 | Phase 1 | Complete |
+| REF-04 | Phase 1 | Complete |
+| REF-05 | Phase 1 | Complete |
 | TRI-01 | Phase 2 | Pending |
 | TRI-02 | Phase 2 | Pending |
 | TRI-03 | Phase 2 | Pending |

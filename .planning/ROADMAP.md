@@ -12,7 +12,7 @@ This milestone is a brownfield correctness audit. The library has Phases 0–5 p
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Reference-path parity vs nn.GRU** - Pin `GRULayer` (Identity quantizers, dense) to `torch.nn.GRU` at the layer level for fwd / bwd / h_T / gate-ordering
+- [x] **Phase 1: Reference-path parity vs nn.GRU** - Pin `GRULayer` (Identity quantizers, dense) to `torch.nn.GRU` at the layer level for fwd / bwd / h_T / gate-ordering ✓ 2026-05-13
 - [ ] **Phase 2: Triton fast-path parity vs reference** - Pin every Triton variant (dense, diagonal, monarch, butterfly) fwd+bwd to the reference path, with recent-fix regression tests
 - [ ] **Phase 3: Structured PyTorch fallback parity** - Pin circulant + LDR per-step paths to hand-rolled references; confirm graceful degradation when `torch-structured` is missing
 - [ ] **Phase 4: Quant-on bit-identity** - Frozen INT8 recipe produces bit-identical output between Triton and reference paths across all variants; resolve per-channel min_max observer gap
@@ -33,11 +33,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   4. The existing cell-level `< 1e-5` parity gate in `tests/test_parity.py` is unchanged (not loosened).
   5. Any mismatch surfaced during REF triggers a failing test FIRST + a beads issue + a fix landing in this phase; no silent loosening of tolerances.
 **Plans**: 5 plans
-- [ ] 01-01-PLAN.md — Translation helpers + 3 gate-ordering micro-tests + round-trip smoke test (foundation; no parametrize)
-- [ ] 01-02-PLAN.md — Forward + h_T parity grid (test_layer_forward_matches_nn_gru + test_layer_h_T_matches_nn_gru, fast + slow each)
-- [ ] 01-03-PLAN.md — Backward (gradient) parity grid covering (dx, dh_0, dW_ih, dW_hh, db_ih, db_hh)
-- [ ] 01-04-PLAN.md — h_0 ≠ 0 random initial state parity (out + h_T together)
-- [ ] 01-05-PLAN.md — Audit kickoff: run full suite, triage failures, file bd issues, drive Commit A → Commit B per finding, write phase-exit SUMMARY
+- [x] 01-01-PLAN.md — Translation helpers + 3 gate-ordering micro-tests + round-trip smoke test (foundation; no parametrize)
+- [x] 01-02-PLAN.md — Forward + h_T parity grid (test_layer_forward_matches_nn_gru + test_layer_h_T_matches_nn_gru, fast + slow each)
+- [x] 01-03-PLAN.md — Backward (gradient) parity grid covering (dx, dh_0, dW_ih, dW_hh, db_ih, db_hh)
+- [x] 01-04-PLAN.md — h_0 ≠ 0 random initial state parity (out + h_T together)
+- [x] 01-05-PLAN.md — Audit kickoff: run full suite, triage failures, file bd issues, drive Commit A → Commit B per finding, write phase-exit SUMMARY
 
 ### Phase 2: Triton fast-path parity vs reference
 **Goal**: Every Triton variant (dense, diagonal, monarch, butterfly) matches the reference path fwd+bwd at < 1e-5 on the shape grid, with explicit regression coverage for the recent fix cluster (butterfly OOB, autotuned-bwd accumulator slab zeroing, cross-CTA fence).
@@ -116,7 +116,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Reference-path parity vs nn.GRU | 0/5 | Planned | - |
+| 1. Reference-path parity vs nn.GRU | 5/5 | Complete ✓ | 2026-05-13 |
 | 2. Triton fast-path parity vs reference | 0/TBD | Not started | - |
 | 3. Structured PyTorch fallback parity | 0/TBD | Not started | - |
 | 4. Quant-on bit-identity | 0/TBD | Not started | - |
