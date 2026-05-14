@@ -133,9 +133,18 @@ class FakeQuantize(nn.Module, ABC):
         return scale, zp
 
     def _update_observer(self, x: torch.Tensor) -> None:
-        # TODO(phase=4): per-channel running stats. Phase 1 stub uses global.
-        cur_min = x.detach().min()
-        cur_max = x.detach().max()
+        axis = self.config.axis
+        if axis is None:
+            # Per-tensor: global scalar reduction (Phase 1 behavior preserved).
+            cur_min = x.detach().min()
+            cur_max = x.detach().max()
+        else:
+            # Per-channel: reduce over every dim except `axis`. Same pattern
+            # as FakeQuantizePerChannel._compute_scale_zp (lines 181-189),
+            # but keepdim=False — running stats are 1-D per-channel tensors.
+            dims = [d for d in range(x.ndim) if d != axis]
+            cur_min = x.detach().amin(dim=dims)
+            cur_max = x.detach().amax(dim=dims)
         if not self._initialized:
             self.running_min = cur_min
             self.running_max = cur_max
