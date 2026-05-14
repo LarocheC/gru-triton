@@ -499,3 +499,271 @@ def test_no_cv_cache_modifier_live_uses_in_scan_source() -> None:
         "tests/test_triton_scan_strict.py::test_persistent_kernel_deterministic "
         "for the dynamic guard."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Quant-on bit-identity (frozen INT8 per-channel weight +
+#                                  per-tensor activation)
+# Tolerance: per D-42 disposition (resolved at Plan 04-01 checkpoint)
+# ---------------------------------------------------------------------------
+
+
+def _make_dense_layer_quant_int8(
+    in_dim: int, hidden: int, h_scale: float = 0.02
+) -> GRULayer:
+    """Frozen INT8 per-channel weight + per-tensor activation + per-tensor hidden.
+
+    Implements CONTEXT D-41's literal recipe (frozen INT8 per-channel weight
+    + per-tensor activation) — NOT the looser fp32-weight + frozen-INT8-hidden
+    shortcut used by ``tests/test_triton_scan.py:213-389``. The earlier
+    analog only quantized the hidden activation because the realistic-tier
+    test only needed to exercise the in-kernel fake-quant; Phase 4 needs the
+    full audit recipe per D-41 / QNT-01.
+
+    Recipe (matches ``PRESETS['int8_per_channel']`` in shape; bits + axis
+    identical, only the observer mode changes to support inline freeze):
+
+    - weight:    ``bits=8, axis=0, mode='min_max', symmetric=True`` — per-channel
+      scale per row of W; ``axis=0`` is the ``hidden_size`` axis.
+    - input_act: ``bits=8, axis=None, mode='min_max', symmetric=True`` — per-tensor.
+    - hidden:    ``bits=8, axis=None, mode='frozen', symmetric=True`` — per-tensor;
+      scale is set manually to ``h_scale``.
+
+    Freeze procedure (inline; Phase 5 owns full ``calibrate → freeze_all``
+    plumbing via ``src/gru_qat/calibration.py`` — this helper mirrors the
+    same end state via ``min_max`` + ``cell.freeze_quantizers()``):
+
+    1. Run one forward over a representative ``x`` (``torch.randn * 0.5``,
+       the 'realistic' adversarial class scale per D-46). This populates
+       ``running_min`` / ``running_max`` on the input_act quantizer AND on
+       every weight quantizer (the weight quantizers see ``W`` on each
+       forward via ``cell.quantize_weights()``).
+    2. Call ``cell.freeze_quantizers()`` — switches every observer-mode
+       quantizer to frozen mode by copying running stats into ``scale`` /
+       ``zp`` (``src/gru_qat/quantizers.py:97-105``). The hidden quantizer
+       is already in ``mode='frozen'`` from construction; the scale was set
+       manually before the calibration pass so the calibration pass does
+       not touch it (``mode='frozen'`` short-circuits ``_update_observer``
+       per ``src/gru_qat/quantizers.py:88-95``).
+    3. After freeze, every weight quantizer has a ``[hidden,]``-shaped
+       ``scale`` buffer (per-channel along ``axis=0``); the input_act and
+       hidden quantizers have scalar ``scale`` buffers.
+
+    Mirrors ``tests/test_triton_scan.py:240-251`` in shape and ``h_scale``
+    value but extends the recipe per D-41. Mirrors
+    ``PRESETS['int8_per_channel']`` in axis + bits but uses
+    ``mode='min_max'`` for the inline freeze.
+
+    NOTE: Requires the QNT-04 fix (Plan 04-01 Task 3 / Commit B) for the
+    per-channel weight quantizers' ``min_max`` observer to produce
+    per-channel running stats correctly. Pre-fix, the per-channel weight
+    quantizer's ``running_min`` / ``running_max`` would collapse to scalars
+    and ``freeze()`` would produce a per-tensor scale instead of a
+    per-channel scale. The helper depends on Commit B landing.
+    """
+    from gru_qat.quantizers import FakeQuantizePerTensor
+    bits = 8
+    rec = QuantRecipe(
+        weight=QuantizerConfig(
+            bits=bits, axis=0, mode="min_max", symmetric=True, name="W_int8_pc"
+        ),
+        input_act=QuantizerConfig(
+            bits=bits, axis=None, mode="min_max", symmetric=True, name="x_int8_pt"
+        ),
+        hidden=QuantizerConfig(
+            bits=bits, axis=None, mode="frozen", symmetric=True, name="h_int8_pt"
+        ),
+    )
+    layer = GRULayer(
+        in_dim, hidden, recipe=rec, gate_layout="fused", pre_batch_input=True
+    )
+    # Manually freeze the hidden quantizers at h_scale BEFORE the calibration
+    # pass so the pass doesn't touch them (mode='frozen' short-circuits
+    # _update_observer per quantizers.py:88-95).
+    for q in (layer.cell.quant_h_in, layer.cell.quant_h_out):
+        assert isinstance(q, FakeQuantizePerTensor)
+        q.scale = torch.tensor(h_scale)
+        q.zero_point = torch.tensor(0.0)
+    # Inline calibration: one forward populates running_min/max on the
+    # weight and input_act quantizers. Use realistic-tier x scaling.
+    layer.eval()
+    with torch.no_grad():
+        cal_x = torch.randn(8, 4, in_dim) * 0.5  # T=8, B=4 — small enough for CPU
+        cal_h0 = torch.randn(4, hidden) * 0.5
+        layer(cal_x, cal_h0)
+    # Switch weight + input_act quantizers from min_max → frozen via the
+    # standard freeze() path. The hidden quantizers are already frozen.
+    layer.cell.freeze_quantizers()
+    return layer
+
+
+def _adversarial_inputs(
+    cls: str,
+    T: int,
+    B: int,
+    H: int,
+    device: torch.device,
+    h_scale: float = 0.02,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ``(x, h0)`` inputs per D-46 adversarial class.
+
+    Three classes per kernel direction:
+
+    - ``"realistic"``: ``torch.randn(...) * 0.5`` — baseline, scaled to fit
+      INT8 dynamic range. Mirrors ``tests/test_triton_diagonal.py:147``
+      scaling.
+    - ``"near-saturation"``: values at the INT8 boundary. ``h_scale * qmax``
+      is the maximum representable value before clipping; use
+      ``torch.linspace(-0.99, 0.99, ...) * (h_scale * 127)`` to land just
+      inside.
+    - ``"large-magnitude"``: ``torch.randn(...) * 5`` — forces in-kernel
+      clipping; tests that reference and Triton clip identically. Less
+      extreme than ``tests/test_parity.py:100-101``'s ``* 100`` (kernel
+      reasonable-range, not stress).
+    """
+    qmax = 127  # int8 symmetric
+    x_max = h_scale * qmax  # value at the saturation boundary
+    if cls == "realistic":
+        x = torch.randn(T, B, H, device=device) * 0.5
+        h0 = torch.randn(B, H, device=device) * 0.5
+    elif cls == "near-saturation":
+        x = (
+            torch.linspace(-0.99, 0.99, T * B * H, device=device).reshape(T, B, H)
+            * x_max
+        ).contiguous()
+        h0 = (
+            torch.linspace(-0.99, 0.99, B * H, device=device).reshape(B, H) * x_max
+        ).contiguous()
+    elif cls == "large-magnitude":
+        x = torch.randn(T, B, H, device=device) * 5.0
+        h0 = torch.randn(B, H, device=device) * 5.0
+    else:
+        raise ValueError(f"unknown adversarial class: {cls}")
+    return x, h0
+
+
+# Phase 4 D-49: smaller grid than Phase 2 (bit-identity is binary, not a
+# distribution sweep). T x B x H grid; T in {8, 64} (fast), T in {512} slow.
+QUANT_FAST_GRID = [
+    (T, B, H)
+    for T in (8, 64)
+    for B in (1, 4, 32)
+    for H in (32, 128, 512)
+]  # 18 cases per D-49
+
+QUANT_SLOW_GRID = [
+    (T, B, H)
+    for T in (512,)
+    for B in (1, 4, 32)
+    for H in (32, 128, 512)
+]  # 9 cases per D-49
+
+
+@cuda_only
+def test_dense_quant_probe_bit_identity() -> None:
+    """Plan 04-01 probe (D-41 / D-42): under frozen INT8 per-channel weight +
+    per-tensor activation, does Triton dense match reference bit-identically?
+
+    Shape: T=8, B=4, H=64 (smallest realistic-but-non-tiny shape that
+    exercises the quant + matmul pipeline; per CONTEXT specifics).
+
+    ``gru_scan`` returns only ``out`` of shape ``[T, B, H]``
+    (``src/gru_qat/triton_kernels/scan.py:1569-1586``); the final hidden
+    state ``h_T`` is extracted as ``out[-1]`` (same convention as
+    ``GRULayer.forward`` — see ``src/gru_qat/gru_layer.py:259-262``).
+
+    Bound: ``torch.equal`` on 6 independently-checked tensors:
+
+    1. ``out``     — full per-step trajectory.
+    2. ``h_T``     — final hidden state (``out[-1]``).
+    3. ``dx``      — input gradient.
+    4. ``dh0``     — initial-hidden-state gradient.
+    5. ``dWh_cat`` — hidden-weight gradient (rows in ``[r, z, n]`` order to
+       match ``quantize_weights()``'s concat axis=0 per
+       ``src/gru_qat/gru_cell.py:268``).
+    6. ``dbh_cat`` — hidden-bias gradient (same row order).
+
+    If even ONE fails, the disposition resolution at the
+    ``checkpoint:human-verify`` (Plan 04-01 Task 4) lands on Result B
+    (tight-INT8-grid: ``abs_diff < h_scale * 1`` = one INT8 step) or
+    Result C (defer kernel change to Phase 7) depending on the magnitude
+    of the failing per-tensor max abs diff.
+
+    This test is the gate. Plans 04-02..04 are written AFTER the human-
+    verified disposition lands; their assertion shape mirrors whichever
+    Result (A: ``torch.equal``; B: ``abs_diff < h_scale``) the user picks
+    at the checkpoint.
+
+    Depends on Plan 04-01 Task 3 / Commit B (QNT-04 ``_update_observer``
+    fix) — the helper's ``cell.freeze_quantizers()`` requires per-channel
+    running stats from the per-channel weight quantizer.
+    """
+    import torch.nn.functional as F
+    from gru_qat.triton_kernels.scan import gru_scan as _gru_scan
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("highest")
+    device = torch.device("cuda")
+    T, B, H = 8, 4, 64
+    IN = H
+
+    layer = _make_dense_layer_quant_int8(IN, H).to(device).eval()
+    x, h0 = _adversarial_inputs("realistic", T, B, IN, device)
+    # Both reference and Triton paths see distinct require_grad leaves so
+    # ``.grad`` collection is independent.
+    ref_x = x.detach().clone().requires_grad_()
+    ref_h0 = h0.detach().clone().requires_grad_()
+    ref_out, ref_hT = layer(ref_x, ref_h0)
+    ref_out.float().pow(2).sum().backward()
+
+    # Reference grads on the cell's hidden weights / biases, concat'd in
+    # the same row order as quantize_weights()'s axis=0 cat ([r, z, n]).
+    ref_dWh_cat = torch.cat(
+        [layer.cell.W_hr.grad, layer.cell.W_hz.grad, layer.cell.W_hn.grad],
+        dim=0,
+    )
+    ref_dbh_cat = torch.cat(
+        [layer.cell.b_hr.grad, layer.cell.b_hz.grad, layer.cell.b_hn.grad]
+    )
+
+    w = layer.cell.quantize_weights()
+    Wi_cat = w.Wi_cat.detach().clone()
+    bi_cat = w.bi_cat.detach().clone()
+    Wh_cat = w.Wh_cat.detach().clone().requires_grad_()
+    bh_cat = w.bh_cat.detach().clone().requires_grad_()
+    tri_x = x.detach().clone().requires_grad_()
+    tri_h0 = h0.detach().clone().requires_grad_()
+    # IMPORTANT: with D-41's recipe, input_act is now frozen-INT8 per-tensor.
+    # Apply the input-side fake-quant BEFORE the linear projection so the
+    # Triton path sees the same `gi` as the reference (which quantizes
+    # inside cell.step()).
+    xq = layer.cell.quant_x(tri_x)
+    gi = F.linear(xq, Wi_cat, bi_cat)
+    h_scale = float(layer.cell.quant_h_in.scale.item())
+    h_in_q = (h_scale, -127, 127)
+    h_out_q = (h_scale, -127, 127)
+    tri_out = _gru_scan(
+        gi, tri_h0, Wh_cat, bh_cat,
+        h_in_quant=h_in_q, h_out_quant=h_out_q,
+    )
+    tri_hT = tri_out[-1]  # gru_scan returns [T, B, H]; final step is out[-1].
+    tri_out.float().pow(2).sum().backward()
+
+    # 6 independent torch.equal assertions (D-41 / D-42 gate).
+    # Per-tensor failure messages include name, T/B/H, max abs diff,
+    # h_scale and shape, so the checkpoint:human-verify sees the
+    # Result A / B / C signal directly.
+    parity = [
+        ("out",     ref_out,    tri_out),
+        ("h_T",     ref_hT,     tri_hT),
+        ("dx",      ref_x.grad, tri_x.grad),
+        ("dh0",     ref_h0.grad, tri_h0.grad),
+        ("dWh_cat", ref_dWh_cat, Wh_cat.grad),
+        ("dbh_cat", ref_dbh_cat, bh_cat.grad),
+    ]
+    for name, ref_t, tri_t in parity:
+        max_diff = (ref_t - tri_t).abs().max().item()
+        assert torch.equal(ref_t, tri_t), (
+            f"{name}: torch.equal failed for cls=realistic "
+            f"(T={T},B={B},H={H}); max abs diff {max_diff:.4e}; "
+            f"h_scale={h_scale}; shape={tuple(ref_t.shape)}"
+        )
