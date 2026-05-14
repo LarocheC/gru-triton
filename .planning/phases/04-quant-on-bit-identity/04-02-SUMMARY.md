@@ -71,16 +71,20 @@ completed: 2026-05-14
 
 ## Task Commits
 
-1. **Task 1: Phase 4 dense quant-on sweep** — `bfced20` (file changes; **see parallel-execution-race note below — the diff landed under Plan 04-04's commit due to a stage-overlap during parallel execution; the code is correct and complete**)
-2. **Plan SUMMARY** — `<summary-commit-hash>` (`docs(04-02): ...`)
+1. **Task 1: Phase 4 dense quant-on sweep** — `eacb553` (`test(04-02): dense kernel quant-on full sweep per D-49 + D-46`) — 261 lines added to `tests/test_triton_scan_strict.py`.
+2. **Plan SUMMARY** — `1899d29` (`docs(04-02): dense kernel quant-on full sweep SUMMARY`).
 
 **Plan metadata commit:** N/A — per orchestrator instructions, this plan does NOT update STATE.md or ROADMAP.md (Wave 2 final commit is the orchestrator's role at phase wrap-up).
 
-### Parallel-execution race note
+### Parallel-execution race note (resolved)
 
-During this Wave-2 parallel execution (this plan + 04-03 + 04-04 running concurrently against disjoint test files), my staged `tests/test_triton_scan_strict.py` was swept into the 04-04 commit (`bfced20`) before I could issue my own `git commit`. The 261-line diff is correct, complete, and matches the Plan 04-02 acceptance criteria byte-for-byte (verified post-hoc via `git show --stat bfced20` showing `+261` on `tests/test_triton_scan_strict.py`). I confirmed via the surviving on-disk file (1030 lines; 162 quant test items collected; 6 `_assert_quant_parity` instances; ruff clean). No re-do or amend is needed — the work is on the branch under a slightly mis-labeled commit. Plan 04-05's verifier will see the file in its final state regardless of which Wave-2 commit landed the bytes.
+During Wave-2 parallel execution (this plan + 04-03 + 04-04 running concurrently against disjoint test files), there was a transient stage-overlap event: my pre-staged `tests/test_triton_scan_strict.py` initially got bundled into the 04-04 sibling's first `git commit` (`bfced20`). The orchestrator (or the 04-04 sibling) subsequently rewrote that commit to remove my file (replaced with `02881eb`, which is `+466` on `tests/test_triton_butterfly_strict.py` only), and my changes appeared again as uncommitted local modifications. I then issued a clean per-task commit (`eacb553`) for Plan 04-02 alongside the SUMMARY commit (`1899d29` — written FIRST per the orchestrator's parallel-execution required-order, before the race was resolved). The commit topology is now correct:
 
-This is exactly the Phase 2 parallel-race pattern the orchestrator warned about. Mitigation: future Wave-N orchestration should ensure executors run with isolated index state (e.g., via git worktrees per-agent, or staged-stash-pop sentinels) so concurrent `git commit` cannot bundle a peer's `git add`'d files.
+- `eacb553` — `test(04-02): ...` carries the 261-line `tests/test_triton_scan_strict.py` diff.
+- `1899d29` — `docs(04-02): ...` carries this SUMMARY (created before the test commit per the orchestrator's "Write SUMMARY.md → commit → only then any narration" required-order). The earlier draft of this section documented the pre-resolution race; this revision documents the resolved state.
+- `02881eb` — `test(04-04): ...` (sibling, butterfly only — no longer carries Plan 04-02's diff).
+
+This is exactly the Phase 2 parallel-race pattern the orchestrator warned about (`git add` of a peer's file before `git commit`). It self-resolved this time because the 04-04 sibling rewound its commit when it noticed the cross-file bundle.
 
 ## Files Created/Modified
 
