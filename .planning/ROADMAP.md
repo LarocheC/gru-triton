@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Reference-path parity vs nn.GRU** - Pin `GRULayer` (Identity quantizers, dense) to `torch.nn.GRU` at the layer level for fwd / bwd / h_T / gate-ordering ✓ 2026-05-13
 - [x] **Phase 2: Triton fast-path parity vs reference** - Pin every Triton variant (dense, diagonal, monarch, butterfly) fwd+bwd to the reference path, with recent-fix regression tests ✓ 2026-05-13 (Option C disposition)
-- [ ] **Phase 3: Structured PyTorch fallback parity** - Pin circulant + LDR per-step paths to hand-rolled references; confirm graceful degradation when `torch-structured` is missing
+- [x] **Phase 3: Structured PyTorch fallback parity** - Pin circulant + LDR per-step paths to hand-rolled references; confirm graceful degradation when `torch-structured` is missing ✓ 2026-05-14
 - [ ] **Phase 4: Quant-on bit-identity** - Frozen INT8 recipe produces bit-identical output between Triton and reference paths across all variants; resolve per-channel min_max observer gap
 - [ ] **Phase 5: Calibration + freeze lifecycle** - `calibrate` actually exercises observers; `freeze_all` produces correct scales; Triton round-trip after freeze matches reference
 - [ ] **Phase 6: Edge-case sweeps** - T=1, B=1, H∈{1,2}, T∈{512,1024}, T=0/B=0 across every path
@@ -68,9 +68,9 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Dense / Diagonal / Circulant kinds (local impls) continue to work in the same test run when `torch-structured` is unavailable.
   4. Any mismatch surfaced becomes a failing test → beads issue → fix in-phase; the hand-rolled references stay in the test file (not promoted into `src/`).
 **Plans**: 3 plans
-- [ ] 03-01-PLAN.md — Circulant parity (STR-01): new tests/test_structure_parity.py with Toeplitz + FFT helpers, self-consistency cross-check, fwd + autograd-bwd parity at < 1e-5 (FAST + SLOW grids)
-- [ ] 03-02-PLAN.md — LDR parity (STR-02): external-library spec read of torch_structured.structured.{layers,krylov}; _build_ldr_matrix_from_factors slow-Krylov helper; micro-validation + fwd + autograd-bwd parity at < 1e-5 over (B, H, rank) grid
-- [ ] 03-03-PLAN.md — STR-03 graceful-degradation + TESTING.md update (monkeypatch introduction) + phase-exit SUMMARY closing STR-01/02/03 with bd tally + hand-off to Phase 4
+- [x] 03-01-PLAN.md — Circulant parity (STR-01): new tests/test_structure_parity.py with Toeplitz + FFT helpers, self-consistency cross-check, fwd + autograd-bwd parity at < 1e-5 (FAST + SLOW grids)
+- [x] 03-02-PLAN.md — LDR parity (STR-02): external-library spec read of torch_structured.structured.{layers,krylov}; _build_ldr_matrix_from_factors slow-Krylov helper; micro-validation + fwd + autograd-bwd parity at < 1e-5 over (B, H, rank) grid
+- [x] 03-03-PLAN.md — STR-03 graceful-degradation + TESTING.md update (monkeypatch introduction) + phase-exit SUMMARY closing STR-01/02/03 with bd tally + hand-off to Phase 4
 
 ### Phase 4: Quant-on bit-identity
 **Goal**: With a frozen INT8 recipe applied, every Triton variant produces bit-identical fwd and bwd against the reference path; resolve (fix or fence) the per-channel `min_max` observer gap.
@@ -127,7 +127,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 |-------|----------------|--------|-----------|
 | 1. Reference-path parity vs nn.GRU | 5/5 | Complete ✓ | 2026-05-13 |
 | 2. Triton fast-path parity vs reference | 6/6 | Complete ✓ (Option C) | 2026-05-13 |
-| 3. Structured PyTorch fallback parity | 0/3 | Planned | - |
+| 3. Structured PyTorch fallback parity | 3/3 | Complete ✓ | 2026-05-14 |
 | 4. Quant-on bit-identity | 0/TBD | Not started | - |
 | 5. Calibration + freeze lifecycle | 0/TBD | Not started | - |
 | 6. Edge-case sweeps | 0/TBD | Not started | - |

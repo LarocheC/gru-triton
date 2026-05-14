@@ -26,9 +26,9 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Structured PyTorch fallbacks parity (STR)
 
-- [ ] **STR-01**: Circulant variant per-step PyTorch path matches a hand-rolled circulant-matmul reference for forward + backward at < 1e-5.
-- [ ] **STR-02**: LDR variant per-step PyTorch path matches a hand-rolled LDR reference for forward + backward at < 1e-5.
-- [ ] **STR-03**: All structured variants degrade gracefully (clear error, not silent wrong-answer) when `torch-structured` is missing.
+- [x] **STR-01**: Circulant variant per-step PyTorch path matches a hand-rolled circulant-matmul reference for forward + backward at < 1e-5. *(`tests/test_structure_parity.py` — FFT/Toeplitz cross-check + production parity; worst max abs 2.62e-6 at H=512)*
+- [x] **STR-02**: LDR variant per-step PyTorch path matches a hand-rolled LDR reference for forward + backward at < 1e-5. *(slow-Krylov full-matrix reference; worst max abs 1.67e-6 at H=512)*
+- [x] **STR-03**: All structured variants degrade gracefully (clear error, not silent wrong-answer) when `torch-structured` is missing. *(monkeypatch on `_import_torch_structured` for monarch/butterfly; `sys.modules` trick for LDR bypass-import path; companion test confirms dense/diagonal/circulant work without dep)*
 
 ### Quant-on parity, reference path = ground truth (QNT)
 
@@ -101,9 +101,9 @@ Populated during roadmap creation by the roadmapper agent.
 | TRI-04 | Phase 2 | Complete |
 | TRI-05 | Phase 2 | Complete |
 | TRI-06 | Phase 2 | Complete |
-| STR-01 | Phase 3 | Pending |
-| STR-02 | Phase 3 | Pending |
-| STR-03 | Phase 3 | Pending |
+| STR-01 | Phase 3 | Complete |
+| STR-02 | Phase 3 | Complete |
+| STR-03 | Phase 3 | Complete |
 | QNT-01 | Phase 4 | Pending |
 | QNT-02 | Phase 4 | Pending |
 | QNT-03 | Phase 4 | Pending |
