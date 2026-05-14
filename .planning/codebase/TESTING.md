@@ -200,7 +200,16 @@ The butterfly OOB regression test (`tests/test_butterfly_dispatch.py:206`) uses 
 
 ## Mocking
 
-**None.** No `unittest.mock`, no `pytest-mock`, no monkeypatching. The library has zero external services and tests exercise real PyTorch / real Triton kernels (when CUDA is available). The only "mock-like" pattern is the `Identity` quantizer subclass, which is a no-op `FakeQuantize` used to dial quantization off in parity tests — that's a production class, not test infrastructure.
+**Default: none.** No `unittest.mock`, no `pytest-mock`. The library has zero external services and tests exercise real PyTorch / real Triton kernels (when CUDA is available). The only "mock-like" pattern in the production code is the `Identity` quantizer subclass, which is a no-op `FakeQuantize` used to dial quantization off in parity tests — that's a production class, not test infrastructure.
+
+**Narrow exception (Phase 3, Plan 03-03):** `pytest.MonkeyPatch` is permitted for **optional-dependency failure-mode tests** — i.e. asserting that a missing external package (currently `torch-structured`) raises a clear `ImportError` with an install hint. Two idioms are blessed:
+
+1. `monkeypatch.setattr("gru_qat.structure._import_torch_structured", _raise_missing_torch_structured)` — when the production code routes through an internal lazy-import helper. Preferred when available.
+2. `monkeypatch.setitem(sys.modules, "<pkg>", None)` — when the production code does `from <pkg> import ...` directly, bypassing the helper (the LDR branch at `src/gru_qat/structure.py:160-172` is the current example). Setting `sys.modules[name] = None` is Python's documented "this module is known to be absent" marker; subsequent imports raise `ImportError`.
+
+See `tests/test_structure_parity.py` STR-03 section (`test_missing_torch_structured_raises_clear_error`, `test_missing_ldr_raises_clear_error`, `test_local_impls_work_without_torch_structured`) for the canonical patterns.
+
+**Convention going forward:** every new optional dependency should grow a matching failure-mode test in this style. The rule of thumb is "if the dep is optional, prove it in a test." Do **not** broaden this exception to normal logic tests — real layers, real tensors, real kernels remain the default. If a logic test reaches for `monkeypatch`, that's a signal the test is the wrong shape.
 
 ## Fixtures and Test Data
 
