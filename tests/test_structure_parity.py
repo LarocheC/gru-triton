@@ -25,6 +25,7 @@ guarded per-section.
 
 from __future__ import annotations
 
+import sys
 import warnings
 
 import pytest
@@ -38,7 +39,12 @@ import torch.nn as nn
 # state — set once at import is the cleanest signal.
 torch.set_float32_matmul_precision("highest")
 
-from gru_qat.structure import _CirculantLinear, _LDRLinear  # noqa: E402
+from gru_qat.structure import (  # noqa: E402
+    _CirculantLinear,
+    _LDRLinear,
+    StructureConfig,
+    make_structured_linear,
+)
 
 
 def _build_toeplitz_from_kernel(c: torch.Tensor) -> torch.Tensor:
@@ -668,3 +674,137 @@ def test_ldr_backward_matches_autograd_reference_slow(B: int, H: int, rank: int)
         assert max_diff < 1e-5, (
             f"{name} max abs diff {max_diff:.4e} (B={B},H={H},rank={rank})"
         )
+
+
+# ===========================================================================
+# STR-03 section: graceful-degradation tests
+# ===========================================================================
+#
+# Phase 3 Plan 03-03 — confirm that ``torch-structured`` is genuinely
+# optional:
+#
+#   kind        path to torch_structured        expected without it
+#   --------    ------------------------------  -------------------------
+#   dense       (none — pure torch.nn.Linear)   WORKS
+#   diagonal    (none — local _DiagonalLinear)  WORKS
+#   circulant   (none — local _CirculantLinear) WORKS
+#   monarch     _import_torch_structured()      ImportError("torch-structured")
+#   butterfly   _import_torch_structured()      ImportError("torch-structured")
+#   ldr         from torch_structured.structured.layers
+#                       import LDRSubdiagonal    ImportError("torch-structured")
+#
+# Two mocking idioms are used (D-34):
+#   * monarch / butterfly / local-impl controls — monkeypatch.setattr
+#     ``gru_qat.structure._import_torch_structured`` to raise ImportError.
+#     This is the helper the production code routes through.
+#   * ldr — production code at ``src/gru_qat/structure.py:160-172`` does
+#     ``from torch_structured.structured.layers import LDRSubdiagonal``
+#     directly, bypassing ``_import_torch_structured``. The setattr
+#     monkeypatch above does NOT affect this branch. Instead we simulate
+#     the missing package via ``monkeypatch.setitem(sys.modules, ..., None)``
+#     so Python's import machinery raises ImportError on the next ``from``
+#     import of those names.
+#
+# This is the first introduction of ``pytest.MonkeyPatch`` to the codebase.
+# Per the convention update in ``.planning/codebase/TESTING.md``, this is
+# scoped to optional-dependency failure-mode tests; broader logic tests
+# continue to use real layers / real tensors.
+# ===========================================================================
+
+
+def _raise_missing_torch_structured() -> None:
+    """Stand-in for ``_import_torch_structured`` that always raises the
+    ImportError the production helper would raise on a missing install.
+
+    Matches the production message verbatim (``src/gru_qat/structure.py:65-68``)
+    so the test asserts the user-facing string, not just any ImportError.
+    Function annotation is ``-> None`` even though the function never
+    returns — Python signature conventions; ``raise`` exits the frame.
+    """
+    raise ImportError(
+        "torch-structured is required for structured GRU weights. "
+        "Install with: pip install 'gru-qat[structured]'"
+    )
+
+
+@pytest.mark.parametrize("kind", ["monarch", "butterfly"])
+def test_missing_torch_structured_raises_clear_error(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """STR-03: monarch and butterfly raise a clear ImportError when
+    ``torch-structured`` is unavailable.
+
+    Both kinds route through ``_import_torch_structured`` (see
+    ``src/gru_qat/structure.py:141`` and ``:152``), so a single
+    ``monkeypatch.setattr`` on that helper covers both code paths. The
+    error message must contain ``torch-structured`` so users know what to
+    install.
+
+    LDR has a separate test (``test_missing_ldr_raises_clear_error``)
+    because its import path bypasses ``_import_torch_structured`` — see
+    the comment block at the top of this section.
+    """
+    monkeypatch.setattr(
+        "gru_qat.structure._import_torch_structured",
+        _raise_missing_torch_structured,
+    )
+    cfg = StructureConfig(kind=kind, nblocks=4, butterfly_nblocks=1)
+    with pytest.raises(ImportError, match=r"torch-structured"):
+        make_structured_linear(cfg, 32, 32)
+
+
+def test_missing_ldr_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """STR-03: ldr raises a clear ImportError when ``torch-structured`` is
+    unavailable.
+
+    The LDR branch in ``src/gru_qat/structure.py:160-172`` does
+    ``from torch_structured.structured.layers import LDRSubdiagonal``
+    directly, bypassing ``_import_torch_structured``. To simulate a
+    missing package we set the relevant submodules in ``sys.modules`` to
+    ``None`` — Python's import machinery treats ``sys.modules[name] = None``
+    as the documented "this module is known to be absent" marker and
+    raises ImportError on the next ``from name import ...``. The
+    production ``try / except ImportError`` then wraps the message with
+    the ``"torch-structured is required ..."`` install hint, which is what
+    the test asserts on.
+    """
+    monkeypatch.setitem(sys.modules, "torch_structured", None)
+    monkeypatch.setitem(sys.modules, "torch_structured.structured", None)
+    monkeypatch.setitem(
+        sys.modules, "torch_structured.structured.layers", None
+    )
+    cfg = StructureConfig(kind="ldr", ldr_rank=2)
+    with pytest.raises(ImportError, match=r"torch-structured"):
+        make_structured_linear(cfg, 32, 32)
+
+
+@pytest.mark.parametrize("kind", ["dense", "diagonal", "circulant"])
+def test_local_impls_work_without_torch_structured(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """STR-03: dense, diagonal, and circulant produce working layers even
+    when ``torch-structured`` is missing.
+
+    These three kinds have local implementations (``nn.Linear``,
+    ``_DiagonalLinear``, ``_CirculantLinear``) and must NOT depend on the
+    optional dep. We still monkeypatch ``_import_torch_structured`` to
+    fail loudly — if any of these three accidentally start calling it
+    (e.g., a refactor that adds an unrelated import in the dispatch), the
+    test will trip immediately.
+    """
+    monkeypatch.setattr(
+        "gru_qat.structure._import_torch_structured",
+        _raise_missing_torch_structured,
+    )
+    cfg = StructureConfig(kind=kind)
+    layer = make_structured_linear(cfg, 32, 32)
+    x = torch.randn(4, 32)
+    y = layer(x)
+    assert torch.isfinite(y).all(), (
+        f"{kind} produced non-finite output without torch_structured"
+    )
+    assert y.shape == (4, 32), (
+        f"{kind} expected shape (4, 32), got {y.shape}"
+    )
