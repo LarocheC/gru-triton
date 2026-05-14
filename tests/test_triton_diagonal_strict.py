@@ -333,11 +333,25 @@ def _assert_quant_parity(
     h_scale: float,
     *,
     strict: bool,
+    h_scale_mult: float = 1.0,
 ) -> None:
     """Assert quant-on parity per the Phase 4 D-42 disposition.
 
-    strict=True (forward / h_T):    torch.equal contract.
-    strict=False (backward grads):  abs_diff < h_scale (one INT8 step).
+    ``strict=True`` (forward / ``h_T``):    ``torch.equal`` contract.
+    ``strict=False`` (backward grads):       ``abs_diff < h_scale_mult * h_scale``
+    (default ``h_scale_mult=1.0`` — one INT8 step).
+
+    ``h_scale_mult`` is the per-call escape hatch for empirically-loosened bounds
+    documented as Phase 4 findings (e.g. F-04-05-A dense-bwd large-magnitude
+    uses ``2.0``; F-04-05-B butterfly-fwd uses ``5.0`` with ``strict=False``).
+    Every call site that overrides ``h_scale_mult`` must reference the bd issue
+    in a comment.
+
+    Disposition source of truth:
+    ``.planning/phases/04-quant-on-bit-identity/04-DISPOSITION.md`` (D-42 /
+    D-43 — per-file byte-identical helper across Plans 04-02..04). Centralizes
+    the strict-vs-tight-INT8-grid switch so any future disposition revision
+    touches only this helper.
     """
     if strict:
         assert torch.equal(ref, tri), (
@@ -347,10 +361,12 @@ def _assert_quant_parity(
         )
     else:
         max_diff = (ref - tri).abs().max().item()
-        assert max_diff < h_scale, (
+        bound = h_scale_mult * h_scale
+        assert max_diff < bound, (
             f"quant-on tight-INT8-step bound failed for {name}: "
             f"max_abs_diff={max_diff:.4e}, h_scale={h_scale:.4e}, "
-            f"ratio={max_diff/h_scale:.2%}"
+            f"h_scale_mult={h_scale_mult:.2f}, bound={bound:.4e}, "
+            f"ratio={max_diff / h_scale:.2%}"
         )
 
 
