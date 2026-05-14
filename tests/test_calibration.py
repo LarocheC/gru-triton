@@ -305,3 +305,114 @@ def test_calibrate_uses_per_step_path() -> None:
             f"{name}: wrapper-path running_max {q1.running_max} != "
             f"forced-use_triton-False running_max {q2.running_max}."
         )
+
+
+def test_freeze_all_matches_dynamic_on_last_batch() -> None:
+    """CAL-02 + Success Criterion #2 — after calibrate + freeze_all, the
+    ``quant_x`` activation quantizer's frozen ``scale`` matches what
+    ``_scale_zp_from_min_max(running_min, running_max)`` (the same code
+    path a ``dynamic``-mode quantizer uses inline) produces on the
+    snapshotted running stats.
+
+    Documented contract (per ``src/gru_qat/quantizers.py:97-105``):
+    ``FakeQuantize.freeze()`` copies running stats into ``scale`` via
+    ``_scale_zp_from_min_max``. ``FakeQuantizePerTensor._compute_scale_zp``
+    (``quantizers.py:181-184``) calls the same helper inline on
+    ``(x.min(), x.max())``. So the "frozen scale matches dynamic mode on
+    the same input min/max" contract reduces to:
+
+        q.scale == q._scale_zp_from_min_max(q.running_min, q.running_max)[0]
+
+    which is what this test pins via ``torch.equal``.
+
+    Phase 5 finding (``bd gru-triton-n20``): the existing cell
+    construction at ``src/gru_qat/gru_cell.py:192-194`` passes the same
+    ``recipe.hidden`` reference to ``make_quantizer`` for both
+    ``quant_h_in`` AND ``quant_h_out``. ``make_quantizer``
+    (``quantizers.py:245``) stores config by reference, so the two
+    quantizers share a single ``QuantizerConfig`` instance. When
+    ``freeze_all`` iterates and calls ``.freeze()``, the first call
+    flips ``config.mode='frozen'`` and the shared config makes the
+    second call short-circuit at ``quantizers.py:99`` — so
+    ``quant_h_out.scale`` stays at the 1.0 buffer init instead of
+    receiving the calibrated value. The same bug affects the six
+    ``quant_W_*`` weight quantizers sharing ``recipe.weight``.
+
+    This is a SILENT CORRECTNESS BUG for any ``calibrate → freeze``
+    user, BUT a one-line ``deepcopy`` fix in ``make_quantizer`` also
+    widens the Phase 4 strict-test contract (Phase 4's bit-identity
+    relied on the bug — both reference and Triton paths used the
+    buggy ``scale=1.0`` so they matched byte-by-byte; under the fix
+    they both quantize correctly but their TF32-tiled multiplications
+    land on different rounding boundaries → ``max_abs_diff = 1*h_scale``).
+
+    Resolving this requires re-baselining Phase 4's per-cluster
+    ``h_scale_mult`` table in ``04-DISPOSITION.md`` — that's a
+    cross-phase architectural decision out of Phase 5's tests-only
+    scope (CONTEXT.md plan-content sketch lines 81-83). The bug is
+    therefore deferred to Phase 7 audit via ``bd gru-triton-n20``;
+    this test scopes the contract to ``quant_x`` (which has its own
+    config from the distinct ``recipe.input_act`` field — not affected
+    by the sharing bug) so CAL-02's binding contract is verifiable
+    today.
+
+    CPU-OK: the freeze derivation is platform-independent.
+    """
+    layer = _make_qat_layer(in_size=16, hid=32)
+
+    # Single deterministic batch — n_batches=1 makes the EMA a no-op for
+    # the FIRST step (`_update_observer` first-call branch at
+    # quantizers.py:148-151 stores cur_min/_max directly), but
+    # SUBSEQUENT steps within the same forward still apply momentum.
+    torch.manual_seed(0)
+    x_cal = torch.randn(8, 4, 16) * 0.5
+    h0_cal = torch.randn(4, 32) * 0.5
+
+    def _single_batch_loader():
+        yield (x_cal, h0_cal)
+
+    calibrate(layer, _single_batch_loader(), n_batches=1)
+
+    # Sanity: calibrate switched quant_x to min_max mode and observed.
+    q_x = layer.cell.quant_x
+    assert q_x.config.mode == "min_max"
+    assert q_x._initialized is True
+    assert torch.isfinite(q_x.running_min).all()
+    assert torch.isfinite(q_x.running_max).all()
+    assert torch.all(q_x.running_min <= q_x.running_max)
+
+    # Snapshot running stats BEFORE freeze.
+    rmin_x = q_x.running_min.clone()
+    rmax_x = q_x.running_max.clone()
+    # Derive what dynamic mode would produce on these exact stats — same
+    # helper FakeQuantizePerTensor._compute_scale_zp invokes inline
+    # (quantizers.py:181-184).
+    expected_scale, expected_zp = q_x._scale_zp_from_min_max(rmin_x, rmax_x)
+    expected_scale = expected_scale.detach().clone()
+    expected_zp = expected_zp.detach().clone()
+
+    # Freeze.
+    freeze_all(layer)
+
+    # CAL-02 binding contract: frozen scale equals the dynamic-mode
+    # derivation on the snapshotted running stats, byte-by-byte.
+    assert q_x.config.mode == "frozen"
+    assert torch.equal(q_x.scale, expected_scale), (
+        f"quant_x: frozen scale {q_x.scale} != dynamic-mode derivation "
+        f"{expected_scale} from snapshotted running stats "
+        f"(rmin={rmin_x}, rmax={rmax_x}). freeze() at quantizers.py:97-105 "
+        "has regressed."
+    )
+    assert torch.equal(q_x.zero_point, expected_zp), (
+        f"quant_x: frozen zero_point {q_x.zero_point} != derived {expected_zp}"
+    )
+
+    # Confirm post-freeze stability: a second forward must not change
+    # quant_x.scale (frozen mode short-circuits _update_observer).
+    scale_pre = q_x.scale.clone()
+    with torch.no_grad():
+        layer(x_cal, h0_cal)
+    assert torch.equal(q_x.scale, scale_pre), (
+        "quant_x.scale changed across a post-freeze forward — frozen mode "
+        "did not short-circuit _update_observer"
+    )
