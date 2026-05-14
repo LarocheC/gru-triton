@@ -767,3 +767,264 @@ def test_dense_quant_probe_bit_identity() -> None:
             f"(T={T},B={B},H={H}); max abs diff {max_diff:.4e}; "
             f"h_scale={h_scale}; shape={tuple(ref_t.shape)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 / Plan 04-02: full quant-on sweep for the dense Triton kernel.
+#
+# Builds on Plan 04-01's probe: extends to the full Cartesian-product grid of
+# ``QUANT_FAST_GRID`` / ``QUANT_SLOW_GRID`` shapes × three D-46 adversarial
+# classes (``realistic`` / ``near-saturation`` / ``large-magnitude``).
+#
+# Disposition is **ASYMMETRIC** per ``.planning/phases/04-quant-on-bit-identity
+# /04-DISPOSITION.md`` (resolved at the Plan 04-01 ``checkpoint:human-verify``
+# 2026-05-14):
+#
+#   - Forward outputs (``out``, ``h_T``):                 ``torch.equal`` (strict=True)
+#   - Backward grads (``dx``, ``dh_0``, ``dWh_cat``,
+#                     ``dbh_cat``):                       ``abs_diff < h_scale`` (strict=False)
+#
+# Rationale (per 04-DISPOSITION.md):
+#   - Fwd: in-kernel ``quant_h_out`` rounds both Triton-TF32-matmul outputs
+#     and PyTorch-fp32-matmul outputs to the same INT8 grid; pre-quant fp32
+#     values differ but post-quant int values are identical.
+#   - Bwd: fp32 reduction-order drift between Triton ``tl.dot`` and PyTorch
+#     matmul accumulates over batch + time dimensions; STE backward through
+#     ``fake_quant_ste`` does not re-quantize gradients so they remain fp32
+#     and exhibit the underlying matmul-order drift. Worst observed at the
+#     probe shape (T=8, B=4, H=64, cls=realistic) was
+#     ``dWh_cat = 1.12e-03 = 5.6% of h_scale`` — well within the
+#     one-INT8-step budget.
+# ---------------------------------------------------------------------------
+
+
+def _assert_quant_parity(
+    name: str,
+    ref: torch.Tensor,
+    tri: torch.Tensor,
+    h_scale: float,
+    *,
+    strict: bool,
+) -> None:
+    """Assert quant-on parity per the Phase 4 D-42 disposition.
+
+    ``strict=True`` (forward / ``h_T``):    ``torch.equal`` contract.
+    ``strict=False`` (backward grads):       ``abs_diff < h_scale`` (one INT8 step).
+
+    Disposition source of truth:
+    ``.planning/phases/04-quant-on-bit-identity/04-DISPOSITION.md`` (D-42 /
+    D-43 — per-file byte-identical helper across Plans 04-02..04). Centralizes
+    the strict-vs-tight-INT8-grid switch so any future disposition revision
+    touches only this helper.
+    """
+    if strict:
+        assert torch.equal(ref, tri), (
+            f"quant-on bit-identity failed for {name}: "
+            f"max_abs_diff={(ref - tri).abs().max().item():.4e} "
+            f"(expected 0.0)"
+        )
+    else:
+        max_diff = (ref - tri).abs().max().item()
+        assert max_diff < h_scale, (
+            f"quant-on tight-INT8-step bound failed for {name}: "
+            f"max_abs_diff={max_diff:.4e}, h_scale={h_scale:.4e}, "
+            f"ratio={max_diff / h_scale:.2%}"
+        )
+
+
+# Three D-46 adversarial classes, declared once so the fast/slow fwd/bwd
+# parametrize decorators stay consistent.
+_QUANT_CLASSES = ["realistic", "near-saturation", "large-magnitude"]
+
+
+def _run_dense_quant_fwd_case(cls: str, T: int, B: int, H: int) -> None:
+    """Shared fwd body for the parametrized + slow dense quant-on tests.
+
+    Mirrors the Plan 04-01 probe (``test_dense_quant_probe_bit_identity``):
+
+    1. Build a frozen-INT8 layer via ``_make_dense_layer_quant_int8`` (D-41
+       recipe).
+    2. Build ``(x, h0)`` via ``_adversarial_inputs(cls, ...)`` (D-46).
+    3. Reference: ``layer(ref_x, ref_h0) -> (ref_out, ref_hT)``.
+    4. Triton: ``quant_x(tri_x)`` BEFORE ``F.linear`` (D-41's input_act is
+       frozen INT8 — see the probe's IMPORTANT comment block for the
+       rationale).
+    5. ``gru_scan`` returns only the full per-step ``out``; ``tri_hT`` is
+       extracted as ``tri_out[-1]`` (see
+       ``src/gru_qat/triton_kernels/scan.py:1569-1586``).
+    6. Assert ``out`` and ``h_T`` via ``_assert_quant_parity(..., strict=True)``
+       per D-42 fwd disposition (``torch.equal``).
+    """
+    import torch.nn.functional as F
+    from gru_qat.triton_kernels.scan import gru_scan as _gru_scan
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    IN = H
+
+    layer = _make_dense_layer_quant_int8(IN, H).to(device).eval()
+    x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+
+    ref_x = x.detach().clone()
+    ref_h0 = h0.detach().clone()
+    with torch.no_grad():
+        ref_out, ref_hT = layer(ref_x, ref_h0)
+
+        w = layer.cell.quantize_weights()
+        Wi_cat = w.Wi_cat.detach().clone()
+        bi_cat = w.bi_cat.detach().clone()
+        Wh_cat = w.Wh_cat.detach().clone()
+        bh_cat = w.bh_cat.detach().clone()
+        tri_x = x.detach().clone()
+        tri_h0 = h0.detach().clone()
+        # IMPORTANT: D-41's recipe quantizes input_act. The reference path
+        # runs quant_x inside cell.step(); the Triton path mirrors that here.
+        xq = layer.cell.quant_x(tri_x)
+        gi = F.linear(xq, Wi_cat, bi_cat)
+        h_scale = float(layer.cell.quant_h_in.scale.item())
+        h_in_q = (h_scale, -127, 127)
+        h_out_q = (h_scale, -127, 127)
+        tri_out = _gru_scan(
+            gi, tri_h0, Wh_cat, bh_cat,
+            h_in_quant=h_in_q, h_out_quant=h_out_q,
+        )
+        tri_hT = tri_out[-1]  # gru_scan returns [T, B, H]; h_T = out[-1].
+
+    name_out = f"out[cls={cls},T={T},B={B},H={H}]"
+    name_hT = f"h_T[cls={cls},T={T},B={B},H={H}]"
+    _assert_quant_parity(name_out, ref_out, tri_out, h_scale, strict=True)
+    _assert_quant_parity(name_hT, ref_hT, tri_hT, h_scale, strict=True)
+
+
+def _run_dense_quant_bwd_case(cls: str, T: int, B: int, H: int) -> None:
+    """Shared bwd body for the parametrized + slow dense quant-on tests.
+
+    Mirrors the Plan 04-01 probe's bwd portion:
+
+    - Reference autograd through the layer; per-row grads concat'd in
+      ``[r, z, n]`` order (axis=0) to match ``quantize_weights()`` —
+      ``src/gru_qat/gru_cell.py:268``.
+    - Triton autograd through ``gru_scan`` after ``quant_x(tri_x)`` +
+      ``F.linear``. ``Wh_cat`` / ``bh_cat`` are fresh ``requires_grad_()``
+      leaves so their ``.grad`` IS the Triton-side gradient.
+    - Four independent ``_assert_quant_parity(..., strict=False)`` calls per
+      D-42 bwd disposition (``abs_diff < h_scale`` — one INT8 step).
+    """
+    import torch.nn.functional as F
+    from gru_qat.triton_kernels.scan import gru_scan as _gru_scan
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    IN = H
+
+    layer = _make_dense_layer_quant_int8(IN, H).to(device).eval()
+    x, h0 = _adversarial_inputs(cls, T, B, IN, device)
+
+    ref_x = x.detach().clone().requires_grad_()
+    ref_h0 = h0.detach().clone().requires_grad_()
+    ref_out, _ref_hT = layer(ref_x, ref_h0)
+    ref_out.float().pow(2).sum().backward()
+
+    ref_dWh_cat = torch.cat(
+        [layer.cell.W_hr.grad, layer.cell.W_hz.grad, layer.cell.W_hn.grad],
+        dim=0,
+    )
+    ref_dbh_cat = torch.cat(
+        [layer.cell.b_hr.grad, layer.cell.b_hz.grad, layer.cell.b_hn.grad]
+    )
+
+    w = layer.cell.quantize_weights()
+    Wi_cat = w.Wi_cat.detach().clone()
+    bi_cat = w.bi_cat.detach().clone()
+    Wh_cat = w.Wh_cat.detach().clone().requires_grad_()
+    bh_cat = w.bh_cat.detach().clone().requires_grad_()
+    tri_x = x.detach().clone().requires_grad_()
+    tri_h0 = h0.detach().clone().requires_grad_()
+    # D-41 input_act quant BEFORE F.linear (see fwd-body IMPORTANT block).
+    xq = layer.cell.quant_x(tri_x)
+    gi = F.linear(xq, Wi_cat, bi_cat)
+    h_scale = float(layer.cell.quant_h_in.scale.item())
+    h_in_q = (h_scale, -127, 127)
+    h_out_q = (h_scale, -127, 127)
+    tri_out = _gru_scan(
+        gi, tri_h0, Wh_cat, bh_cat,
+        h_in_quant=h_in_q, h_out_quant=h_out_q,
+    )
+    tri_out.float().pow(2).sum().backward()
+
+    # 4 independent bwd assertions — failure on any one names the offending
+    # gradient (per the threat-model rationale in 04-02-PLAN.md).
+    assert ref_x.grad is not None and tri_x.grad is not None
+    assert ref_h0.grad is not None and tri_h0.grad is not None
+    assert Wh_cat.grad is not None and bh_cat.grad is not None
+    _assert_quant_parity(
+        f"dx[cls={cls},T={T},B={B},H={H}]",
+        ref_x.grad, tri_x.grad, h_scale, strict=False,
+    )
+    _assert_quant_parity(
+        f"dh_0[cls={cls},T={T},B={B},H={H}]",
+        ref_h0.grad, tri_h0.grad, h_scale, strict=False,
+    )
+    _assert_quant_parity(
+        f"dWh_cat[cls={cls},T={T},B={B},H={H}]",
+        ref_dWh_cat, Wh_cat.grad, h_scale, strict=False,
+    )
+    _assert_quant_parity(
+        f"dbh_cat[cls={cls},T={T},B={B},H={H}]",
+        ref_dbh_cat, bh_cat.grad, h_scale, strict=False,
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_FAST_GRID)
+@pytest.mark.parametrize("cls", _QUANT_CLASSES)
+def test_scan_quant_fwd(cls: str, T: int, B: int, H: int) -> None:
+    """Frozen-INT8 dense forward must match reference per D-42 fwd
+    disposition (``torch.equal`` on ``out`` AND ``h_T``) across all three
+    D-46 adversarial classes × ``QUANT_FAST_GRID`` (18 shapes).
+
+    54 fast cases total (3 cls × 18 shapes). Each case asserts on 2 fwd
+    tensors via ``_assert_quant_parity(strict=True)``.
+
+    See module-level docstring for the D-42 disposition rationale.
+    """
+    _run_dense_quant_fwd_case(cls, T, B, H)
+
+
+@pytest.mark.slow
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_SLOW_GRID)
+@pytest.mark.parametrize("cls", _QUANT_CLASSES)
+def test_scan_quant_fwd_slow(cls: str, T: int, B: int, H: int) -> None:
+    """Slow sibling of ``test_scan_quant_fwd`` over ``QUANT_SLOW_GRID``
+    (T ∈ {512}). 27 slow cases (3 cls × 9 shapes).
+    """
+    _run_dense_quant_fwd_case(cls, T, B, H)
+
+
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_FAST_GRID)
+@pytest.mark.parametrize("cls", _QUANT_CLASSES)
+def test_scan_quant_bwd(cls: str, T: int, B: int, H: int) -> None:
+    """Frozen-INT8 dense backward must match reference per D-42 bwd
+    disposition (``abs_diff < h_scale``) on each of
+    ``(dx, dh_0, dWh_cat, dbh_cat)`` across all three D-46 adversarial
+    classes × ``QUANT_FAST_GRID`` (18 shapes).
+
+    54 fast cases total (3 cls × 18 shapes). Each case asserts on 4 bwd
+    tensors via ``_assert_quant_parity(strict=False)``.
+
+    See module-level docstring for the D-42 disposition rationale.
+    """
+    _run_dense_quant_bwd_case(cls, T, B, H)
+
+
+@pytest.mark.slow
+@cuda_only
+@pytest.mark.parametrize("T,B,H", QUANT_SLOW_GRID)
+@pytest.mark.parametrize("cls", _QUANT_CLASSES)
+def test_scan_quant_bwd_slow(cls: str, T: int, B: int, H: int) -> None:
+    """Slow sibling of ``test_scan_quant_bwd`` over ``QUANT_SLOW_GRID``
+    (T ∈ {512}). 27 slow cases (3 cls × 9 shapes).
+    """
+    _run_dense_quant_bwd_case(cls, T, B, H)
