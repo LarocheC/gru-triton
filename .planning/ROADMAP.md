@@ -127,7 +127,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] 07-01-PLAN.md — gru-triton-7rj wrapper assert→ValueError hardening + gru-triton-4m6 mypy/ruff cleanup to 0/0 (Wave 1)
 - [x] 07-02-PLAN.md — gru-triton-n20 deepcopy fix + Phase 4 strict-test re-baseline + `divergence` pytest marker (Wave 2, CUDA host)
 - [x] 07-03-PLAN.md — git-log test-before-fix audit + close all 14 bd issues, `bd ready` empty (Wave 3)
-- [ ] 07-04-PLAN.md — AUDIT-REPORT.md authored at repo root + REQUIREMENTS.md RPT-01/02/03 closure (Wave 4)
+- [x] 07-04-PLAN.md — AUDIT-REPORT.md authored at repo root + REQUIREMENTS.md RPT-01/02/03 closure (Wave 4)
 
 ## Progress
 
