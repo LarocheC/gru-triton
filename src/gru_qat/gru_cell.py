@@ -17,7 +17,7 @@ implementations get this wrong and silently lose 1-2% accuracy.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import cast, Literal
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,6 @@ from gru_qat.quantizers import (
     FakeQuantize,
     QuantRecipe,
     QuantizerConfig,
-    factory,
     make_quantizer,
 )
 from gru_qat.structure import StructureConfig, make_structured_linear
@@ -346,7 +345,8 @@ class GRUCellQuant(nn.Module):
         gate_n = self.quant_gate_n(gi_n + r * gh_n)
         n = torch.tanh(gate_n)
         h_new = (1.0 - z) * n + z * h
-        return self.quant_h_out(h_new)
+        # FakeQuantize is an nn.Module; __call__ is typed Any in the stubs.
+        return cast(torch.Tensor, self.quant_h_out(h_new))
 
     def step(
         self, x: torch.Tensor, h: torch.Tensor, w: CellWeights
@@ -404,7 +404,8 @@ class GRUCellQuant(nn.Module):
         # The "stored" h_new is the quantized one — see GRULayer.
 
         # ---- 5. Quantize on the write side (so next step reads quant) ----
-        return self.quant_h_out(h_new)
+        # FakeQuantize is an nn.Module; __call__ is typed Any in the stubs.
+        return cast(torch.Tensor, self.quant_h_out(h_new))
 
     def input_projection(
         self, x_seq: torch.Tensor, w: CellWeights
@@ -459,7 +460,8 @@ class GRUCellQuant(nn.Module):
         gate_n = self.quant_gate_n(gi_n + r * gh_n)
         n = torch.tanh(gate_n)
         h_new = (1.0 - z) * n + z * h
-        return self.quant_h_out(h_new)
+        # FakeQuantize is an nn.Module; __call__ is typed Any in the stubs.
+        return cast(torch.Tensor, self.quant_h_out(h_new))
 
     def forward(
         self, x: torch.Tensor, h: torch.Tensor
@@ -500,8 +502,11 @@ class GRUCellQuant(nn.Module):
         After calibration, call this once before exporting to the inference
         kernel. From this point, scales are read-only.
         """
+        # self.modules() yields self first; an isinstance(FakeQuantize)
+        # check already excludes self (a GRUCellQuant is never a
+        # FakeQuantize), so no explicit `is not self` guard is needed.
         for module in self.modules():
-            if isinstance(module, FakeQuantize) and module is not self:
+            if isinstance(module, FakeQuantize):
                 module.freeze()
 
     # TODO(phase=5): export_int_weights() returning a dict of int tensors,

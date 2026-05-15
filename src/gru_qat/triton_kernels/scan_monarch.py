@@ -11,6 +11,8 @@ smaller per-block working set.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 import torch.nn as nn
 import triton
@@ -36,15 +38,23 @@ def extract_monarch_factors(cell: nn.Module) -> tuple[torch.Tensor, torch.Tensor
     # All three layers share the same shape (square BlockdiagLinear with
     # in_features == out_features == H).
     # struct_Wh_* are BlockdiagLinear instances; their `.weight` is the
-    # [nblocks, out_blksz, in_blksz] factor tensor.
-    Wr = cell.struct_Wh_r.weight
-    Wz = cell.struct_Wh_z.weight
-    Wn = cell.struct_Wh_n.weight
+    # [nblocks, out_blksz, in_blksz] factor tensor. nn.Module attribute
+    # access is typed Tensor | Module by the torch stubs — cast to the
+    # concrete submodule, then read the Tensor weight.
+    Wr = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_r).weight)
+    Wz = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_z).weight)
+    Wn = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_n).weight)
     Wh_struct = torch.stack([Wr, Wz, Wn], dim=0)  # [3, nblocks, blksz, blksz]
     if cell.b_hr is None:
         bh_cat = torch.zeros(3 * cell.hidden_size, device=Wh_struct.device, dtype=Wh_struct.dtype)
     else:
-        bh_cat = torch.cat([cell.b_hr, cell.b_hz, cell.b_hn])
+        bh_cat = torch.cat(
+            [
+                cast(torch.Tensor, cell.b_hr),
+                cast(torch.Tensor, cell.b_hz),
+                cast(torch.Tensor, cell.b_hn),
+            ]
+        )
     return Wh_struct, bh_cat
 
 
@@ -117,8 +127,8 @@ def gru_scan_monarch_forward_pytorch(
     return out
 
 
-@triton.jit
-def gru_scan_monarch_fwd_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_monarch_fwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
     Wh_ptr,            # [3, nblocks, blksz, blksz], fp32
@@ -396,8 +406,8 @@ def gru_scan_monarch_forward_triton(
     return out
 
 
-@triton.jit
-def gru_scan_monarch_bwd_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_monarch_bwd_kernel(  # type: ignore[no-untyped-def]
     # forward inputs (read-only)
     gi_ptr,              # [T, B, 3H]
     h0_ptr,              # [B, H]
@@ -884,8 +894,8 @@ class GRUScanMonarchFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
         Wh_struct: torch.Tensor,
@@ -903,7 +913,9 @@ class GRUScanMonarchFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, dout):  # type: ignore[override]
+    def backward(
+        ctx: Any, dout: torch.Tensor
+    ) -> Any:
         gi, h0, Wh_struct, bh_cat, out = ctx.saved_tensors
         grads = gru_scan_monarch_backward_triton(
             gi, h0, Wh_struct, bh_cat, out, dout,
@@ -932,8 +944,11 @@ def gru_scan_monarch(
     Use ``extract_monarch_factors(cell)`` to pull factors out of a
     tier-1 structured GRUCellQuant.
     """
-    return GRUScanMonarchFunction.apply(
-        gi, h0, Wh_struct, bh_cat, h_in_quant, h_out_quant
+    return cast(
+        torch.Tensor,
+        GRUScanMonarchFunction.apply(  # type: ignore[no-untyped-call]
+            gi, h0, Wh_struct, bh_cat, h_in_quant, h_out_quant
+        ),
     )
 
 
@@ -990,6 +1005,7 @@ def gru_scan_monarch_backward_pytorch(
         # STE backward through quant_h_out: gradient on h_t_q -> on h_t_raw.
         if h_out_quant is not None:
             _, mask_out = _fake_quant(h_t_raw, h_out_quant)
+            assert mask_out is not None  # non-None params => non-None mask
             dh_t = dh_t * mask_out
 
         # h_t_raw = (1-z)*n + z*h_prev

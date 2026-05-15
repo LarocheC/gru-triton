@@ -23,7 +23,7 @@ Quantization in structured mode:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, cast
 
 import torch
 import torch.nn as nn
@@ -57,10 +57,10 @@ class StructureConfig:
 _NEEDS_TORCH_STRUCTURED = {"monarch", "circulant", "butterfly", "ldr"}
 
 
-def _import_torch_structured():
+def _import_torch_structured() -> Any:
     """Soft-import torch_structured. Raises a clear error on missing dep."""
     try:
-        import torch_structured as ts  # type: ignore[import-not-found]
+        import torch_structured as ts
     except ImportError as e:
         raise ImportError(
             "torch-structured is required for structured GRU weights. "
@@ -152,8 +152,11 @@ def make_structured_linear(
 
     if cfg.kind == "monarch":
         ts = _import_torch_structured()
-        return ts.monarch.blockdiag_linear.BlockdiagLinear(
-            in_features, out_features, bias=bias, nblocks=cfg.nblocks
+        return cast(
+            nn.Module,
+            ts.monarch.blockdiag_linear.BlockdiagLinear(
+                in_features, out_features, bias=bias, nblocks=cfg.nblocks
+            ),
         )
 
     if cfg.kind == "circulant":
@@ -235,7 +238,7 @@ class _CirculantLinear(nn.Module):
         y = torch.fft.irfft(col_f * x_f, n=self.n, dim=-1)
         if self.bias is not None:
             y = y + self.bias
-        return y
+        return cast(torch.Tensor, y)
 
 
 class _ButterflyLinear(nn.Module):
@@ -246,7 +249,7 @@ class _ButterflyLinear(nn.Module):
         self.b = butterfly
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.b(x)
+        return cast(torch.Tensor, self.b(x))
 
 
 class _LDRLinear(nn.Module):
@@ -257,4 +260,4 @@ class _LDRLinear(nn.Module):
         self.ldr = ldr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ldr(x)
+        return cast(torch.Tensor, self.ldr(x))

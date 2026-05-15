@@ -9,6 +9,8 @@ Phase 3+ extensions: LSQ-style learnable step gradients (see TODO below).
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 
 
@@ -21,11 +23,13 @@ class STERound(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
         return torch.round(x)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> torch.Tensor:
         return grad_output
 
 
@@ -38,8 +42,8 @@ class STEClamp(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         x: torch.Tensor,
         qmin: float,
         qmax: float,
@@ -50,7 +54,9 @@ class STEClamp(torch.autograd.Function):
         return torch.clamp(x, qmin, qmax)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None]:
         (x,) = ctx.saved_tensors
         mask = (x >= ctx.qmin) & (x <= ctx.qmax)
         return grad_output * mask, None, None
@@ -76,8 +82,16 @@ def fake_quant_ste(
     except the (channel, group) axes after a reshape — see
     FakeQuantizePerGroup.
     """
-    q = STERound.apply(x / scale + zero_point)
-    q = STEClamp.apply(q, qmin, qmax)
+    # torch.autograd.Function.apply is untyped in the torch stubs — cast
+    # the result back to Tensor; the call itself is unavoidably untyped.
+    q = cast(
+        torch.Tensor,
+        STERound.apply(x / scale + zero_point),  # type: ignore[no-untyped-call]
+    )
+    q = cast(
+        torch.Tensor,
+        STEClamp.apply(q, qmin, qmax),  # type: ignore[no-untyped-call]
+    )
     return (q - zero_point) * scale
 
 

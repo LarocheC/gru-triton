@@ -30,7 +30,7 @@ import torch.nn as nn
 @torch.no_grad()
 def calibrate(
     module: nn.Module,
-    loader: Iterable,
+    loader: Iterable[object],
     n_batches: int = 64,
     *,
     only_activations: bool = True,

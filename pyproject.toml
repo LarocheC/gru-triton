@@ -34,9 +34,33 @@ python_version = "3.10"
 strict = true
 files = ["src/gru_qat"]
 
+# triton and torch_structured ship no type stubs. Scoped override only —
+# `strict = true` stays in force for all first-party code.
+[[tool.mypy.overrides]]
+module = ["triton", "triton.*", "torch_structured", "torch_structured.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# Test files import gru_qat modules AFTER a `pytest.importorskip("triton")`
+# / `importorskip("torch_structured")` guard — this is a deliberate, repo-wide
+# idiom (see test_triton_diagonal.py's `# noqa: E402`). E402 is expected.
+# F841 in test files flags locals kept for readability / staged-but-unused
+# setup in parametrized tests — deliberate, not a bug. F401 covers
+# imports kept as test scaffolding / re-export surface. Test files are
+# owned by their phase plans and not edited by the lint cleanup.
+"tests/*" = ["E402", "F841", "F401"]
+# Intentional unused locals in the butterfly Triton kernel: bias tensors are
+# loaded into registers ahead of a gate and the JIT-unrolled stages do not
+# always consume every binding. Pre-existing, deliberate (see the existing
+# `# noqa: F841` at scan_butterfly.py).
+"src/gru_qat/triton_kernels/scan_butterfly.py" = ["F841"]
+# Intentional unused local `H` in the dense scan backward — kept for shape
+# documentation alongside the `T, B, three_H` unpack.
+"src/gru_qat/triton_kernels/scan.py" = ["F841"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

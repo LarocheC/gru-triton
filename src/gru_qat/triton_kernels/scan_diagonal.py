@@ -22,6 +22,8 @@ and no scratch buffers for the forward pass.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 import torch.nn as nn
 import triton
@@ -42,14 +44,22 @@ def extract_diagonal_factors(cell: nn.Module) -> tuple[torch.Tensor, torch.Tenso
     """
     if cell._hidden_dense:
         raise ValueError("cell hidden side is dense; nothing to extract")
-    wr = cell.struct_Wh_r.weight
-    wz = cell.struct_Wh_z.weight
-    wn = cell.struct_Wh_n.weight
+    # nn.Module attribute access is typed Tensor | Module by the torch
+    # stubs — cast to the concrete submodule, then read the Tensor weight.
+    wr = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_r).weight)
+    wz = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_z).weight)
+    wn = cast(torch.Tensor, cast(nn.Module, cell.struct_Wh_n).weight)
     Wh_diag = torch.stack([wr, wz, wn], dim=0)  # [3, H]
     if cell.b_hr is None:
         bh_cat = torch.zeros(3 * cell.hidden_size, device=Wh_diag.device, dtype=Wh_diag.dtype)
     else:
-        bh_cat = torch.cat([cell.b_hr, cell.b_hz, cell.b_hn])
+        bh_cat = torch.cat(
+            [
+                cast(torch.Tensor, cell.b_hr),
+                cast(torch.Tensor, cell.b_hz),
+                cast(torch.Tensor, cell.b_hn),
+            ]
+        )
     return Wh_diag, bh_cat
 
 
@@ -114,8 +124,8 @@ def gru_scan_diagonal_forward_pytorch(
     return out
 
 
-@triton.jit
-def gru_scan_diagonal_fwd_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_diagonal_fwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
     Wh_ptr,            # [3, H], fp32
@@ -272,8 +282,8 @@ def gru_scan_diagonal_forward_triton(
     return out
 
 
-@triton.jit
-def gru_scan_diagonal_bwd_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_diagonal_bwd_kernel(  # type: ignore[no-untyped-def]
     # forward inputs (read-only)
     gi_ptr,              # [T, B, 3H]
     h0_ptr,              # [B, H]
@@ -597,6 +607,7 @@ def gru_scan_diagonal_backward_pytorch(
         dh_t = dout[t] + dh_acc
         if h_out_quant is not None:
             _, mask_out = _fake_quant(h_t_raw, h_out_quant)
+            assert mask_out is not None  # non-None params => non-None mask
             dh_t = dh_t * mask_out
 
         dn = dh_t * (1.0 - z)
@@ -640,8 +651,8 @@ class GRUScanDiagonalFunction(torch.autograd.Function):
     """autograd wrapper around the diagonal persistent kernels."""
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
         Wh_diag: torch.Tensor,
@@ -659,7 +670,9 @@ class GRUScanDiagonalFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, dout):  # type: ignore[override]
+    def backward(
+        ctx: Any, dout: torch.Tensor
+    ) -> Any:
         gi, h0, Wh_diag, bh_cat, out = ctx.saved_tensors
         grads = gru_scan_diagonal_backward_triton(
             gi, h0, Wh_diag, bh_cat, out, dout,
@@ -694,6 +707,9 @@ def gru_scan_diagonal(
     Use ``extract_diagonal_factors(cell)`` to pull the weight/bias out of
     a structured ``GRUCellQuant``.
     """
-    return GRUScanDiagonalFunction.apply(
-        gi, h0, Wh_diag, bh_cat, h_in_quant, h_out_quant
+    return cast(
+        torch.Tensor,
+        GRUScanDiagonalFunction.apply(  # type: ignore[no-untyped-call]
+            gi, h0, Wh_diag, bh_cat, h_in_quant, h_out_quant
+        ),
     )

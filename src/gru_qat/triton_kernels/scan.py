@@ -30,6 +30,8 @@ fake-quant come in follow-on commits.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 import triton
 import triton.language as tl
@@ -71,8 +73,8 @@ _MIN_AUTOTUNE_BLOCK_B = 16
 # concurrently — scheduled-but-not-running CTAs would block forever waiting
 # on their unscheduled siblings. The wrapper is responsible for keeping the
 # total program count <= the GPU's SM count.
-@triton.jit
-def gru_scan_fwd_persistent_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_fwd_persistent_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
     Wh_ptr,            # [3H, H], fp32
@@ -291,8 +293,8 @@ def gru_scan_forward_persistent(
     return out
 
 
-@triton.jit
-def gru_scan_bwd_persistent_kernel(
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_bwd_persistent_kernel(  # type: ignore[no-untyped-def]
     # forward inputs (read-only)
     gi_ptr,           # [T, B, 3H]
     h0_ptr,           # [B, H]
@@ -750,9 +752,9 @@ def gru_scan_backward_persistent(
     return dgi, dh0, dWh, dbh
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS_FWD, key=["T", "B"])
-@triton.jit
-def gru_scan_fwd_kernel(
+@triton.autotune(configs=_AUTOTUNE_CONFIGS_FWD, key=["T", "B"])  # type: ignore[untyped-decorator]
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_fwd_kernel(  # type: ignore[no-untyped-def]
     gi_ptr,            # [T, B, 3H], fp32
     h0_ptr,            # [B, H], fp32
     Wh_ptr,            # [3H, H], fp32 (rows: r, z, n stacked)
@@ -911,9 +913,9 @@ def gru_scan_fwd_kernel(
         sh_b = so_b
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS_BWD, key=["T", "B"])
-@triton.jit
-def gru_scan_bwd_kernel(
+@triton.autotune(configs=_AUTOTUNE_CONFIGS_BWD, key=["T", "B"])  # type: ignore[untyped-decorator]
+@triton.jit  # type: ignore[untyped-decorator]
+def gru_scan_bwd_kernel(  # type: ignore[no-untyped-def]
     # forward inputs (saved tensors, read-only)
     gi_ptr,           # [T, B, 3H]
     h0_ptr,           # [B, H]
@@ -1413,7 +1415,9 @@ def gru_scan_backward_triton(
     in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
-    grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
+    def grid(meta: dict[str, int]) -> tuple[int]:
+        return (triton.cdiv(B, meta["BLOCK_B"]),)
+
     gru_scan_bwd_kernel[grid](
         gi, h0, Wh_cat, bh_cat, out,
         dout,
@@ -1561,8 +1565,8 @@ class GRUScanFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
         Wh_cat: torch.Tensor,
@@ -1580,9 +1584,9 @@ class GRUScanFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(  # type: ignore[override]
-        ctx, dout: torch.Tensor
-    ):
+    def backward(
+        ctx: Any, dout: torch.Tensor
+    ) -> Any:
         gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
         h_in_quant = ctx.h_in_quant
         h_out_quant = ctx.h_out_quant
@@ -1615,8 +1619,11 @@ def gru_scan(
     ``(scale, qmin, qmax)`` tuple), the kernel applies in-kernel fake-quant
     on the hidden state on every step. Per-tensor symmetric, frozen scale.
     """
-    return GRUScanFunction.apply(
-        gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+    return cast(
+        torch.Tensor,
+        GRUScanFunction.apply(  # type: ignore[no-untyped-call]
+            gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+        ),
     )
 
 
@@ -1627,8 +1634,8 @@ class GRUScanPersistentFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
+    def forward(
+        ctx: Any,
         gi: torch.Tensor,
         h0: torch.Tensor,
         Wh_cat: torch.Tensor,
@@ -1646,7 +1653,9 @@ class GRUScanPersistentFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, dout):  # type: ignore[override]
+    def backward(
+        ctx: Any, dout: torch.Tensor
+    ) -> Any:
         gi, h0, Wh_cat, bh_cat, out = ctx.saved_tensors
         grads = gru_scan_backward_persistent(
             gi, h0, Wh_cat, bh_cat, out, dout,
@@ -1668,8 +1677,11 @@ def gru_scan_persistent(
     use 2D grids with cross-CTA barriers; better SM utilization at modest
     batch sizes. ``h_in_quant`` / ``h_out_quant`` enable in-kernel
     fake-quant on the hidden state, same semantics as gru_scan."""
-    return GRUScanPersistentFunction.apply(
-        gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+    return cast(
+        torch.Tensor,
+        GRUScanPersistentFunction.apply(  # type: ignore[no-untyped-call]
+            gi, h0, Wh_cat, bh_cat, h_in_quant, h_out_quant
+        ),
     )
 
 
@@ -1725,9 +1737,11 @@ def gru_scan_forward(
     in_s, in_qmin, in_qmax = h_in_quant or (1.0, -2**31, 2**31 - 1)
     out_s, out_qmin, out_qmax = h_out_quant or (1.0, -2**31, 2**31 - 1)
 
-    # Autotune picks BLOCK_B/OH/K. Grid is a meta-lambda so it sizes from
+    # Autotune picks BLOCK_B/OH/K. Grid is a meta-function so it sizes from
     # whatever BLOCK_B the autotuner chose for this (T, B, H) cell.
-    grid = lambda meta: (triton.cdiv(B, meta["BLOCK_B"]),)
+    def grid(meta: dict[str, int]) -> tuple[int]:
+        return (triton.cdiv(B, meta["BLOCK_B"]),)
+
     gru_scan_fwd_kernel[grid](
         gi,
         h0,

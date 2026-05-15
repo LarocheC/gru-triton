@@ -17,6 +17,8 @@ Hidden state carry is the subtle part:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+
 import torch
 import torch.nn as nn
 
@@ -124,13 +126,18 @@ class GRULayer(nn.Module):
         # step's input — the graph then overwrites a tensor that the next
         # invocation is still holding a pointer to. Plain "default" gets
         # the kernel fusion win without the graph-capture footgun.
+        # The three per-step bodies have different arities (step takes
+        # (x, h); step_with_gi / step_structured take (x, h, w)) — type
+        # `body` as a generic callable so the union assigns cleanly and the
+        # variadic call sites in forward() type-check.
+        body: Callable[..., torch.Tensor]
         if self.cell.is_structured:
             body = self.cell.step_structured
         elif pre_batch_input:
             body = self.cell.step_with_gi
         else:
             body = self.cell.step
-        self._compiled_step = (
+        self._compiled_step: Callable[..., torch.Tensor] = (
             torch.compile(body, mode="default", dynamic=False)
             if compile_step
             else body
@@ -286,11 +293,11 @@ class GRULayer(nn.Module):
     @torch.no_grad()
     def calibrate(
         self,
-        loader,
+        loader: Iterable[object],
         n_batches: int = 64,
         *,
         only_activations: bool = True,
-    ):
+    ) -> dict[str, dict[str, float | list[float]]]:
         """Convenience wrapper around ``gru_qat.calibration.calibrate``.
 
         Switches activation-side quantizers to ``min_max`` observer mode,
