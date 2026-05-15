@@ -156,6 +156,24 @@ class GRULayer(nn.Module):
             x = x.transpose(0, 1)
 
         seq_len, batch_size, _ = x.shape
+        # EDG-04 (Phase 6, D-01): degenerate empty inputs are a caller bug.
+        # A 0-length sequence or 0-size batch cannot launch a Triton grid
+        # (0-size grid) and produces undefined behavior on the per-step
+        # path too. Fail loud here — a single guard after the shape unpack
+        # covers all 7 GRULayer-routed paths (fast dispatch + the two
+        # per-step branches, including circulant/ldr which fall through to
+        # the per-step loop). Use ``if ... raise``, never ``assert``: the
+        # repo runs under ``python -O`` in some contexts and asserts are
+        # stripped. Message names the offending dimension (T or B),
+        # mirroring the gru_cell.py:107 / structure.py:79 convention.
+        if seq_len == 0:
+            raise ValueError(
+                f"seq length T must be > 0; got T={seq_len}"
+            )
+        if batch_size == 0:
+            raise ValueError(
+                f"batch size B must be > 0; got B={batch_size}"
+            )
         if h0 is None:
             h0 = x.new_zeros(batch_size, self.hidden_size)
 
