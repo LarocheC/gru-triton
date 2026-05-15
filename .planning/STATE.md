@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-05-13)
 Phase: 07
 Plan: Not started
 Status: Milestone complete
-Last activity: 2026-05-15
+Last activity: 2026-05-15 - Completed quick task 260515-t9m: Wire up structured optional-dependency extra pinned to torch-structured v0.4.0
 
 Progress: [██████████] 96%
 
@@ -79,6 +79,12 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 ### Blockers/Concerns
 
 - None. All 14 carry-forward bd issues were triaged and CLOSED in Phase 7 Plan 07-03 (3 FIX / 9 ACCEPTED-DIVERGENCE / 2 INDIVIDUAL). `bd ready` is empty.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260515-t9m | Wire up structured optional-dependency extra pinned to torch-structured v0.4.0 | 2026-05-15 | 833dee3 | [260515-t9m-wire-up-structured-optional-dependency-e](./quick/260515-t9m-wire-up-structured-optional-dependency-e/) |
 
 ## Deferred Items
 
