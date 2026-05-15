@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 7 context gathered
-last_updated: "2026-05-15T07:56:22.087Z"
-last_activity: 2026-05-15 -- Phase 07 execution started
+last_updated: "2026-05-15T10:52:00.726Z"
+last_activity: 2026-05-15 -- Plan 07-03 complete (14 bd issues closed, git-log audit done)
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 25
-  completed_plans: 20
-  percent: 80
+  completed_plans: 23
+  percent: 92
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-05-13)
 ## Current Position
 
 Phase: 07 (audit-report-findings-handling) — EXECUTING
-Plan: 1 of 4
-Status: Executing Phase 07
-Last activity: 2026-05-15 -- Phase 07 execution started
+Plan: 4 of 4
+Status: Ready to execute
+Last activity: 2026-05-15 -- Plan 07-03 complete (14 bd issues closed, git-log audit done)
 
-Progress: [████████████░░] 84%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
@@ -48,6 +48,7 @@ Progress: [████████████░░] 84%
 | 2 | 6 | Complete ✓ 2026-05-13 (Option C disposition) |
 | 3 | 3 | Complete ✓ 2026-05-14 |
 | 4 | 5 | Complete ✓ 2026-05-14 (PASS-WITH-MAJOR-CAVEATS) |
+| Phase 07 P03 | 14min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -63,6 +64,8 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - Phase 4 D-42 (revised post-verifier 2026-05-14): per-cluster `h_scale_mult` disposition table in `phases/04-quant-on-bit-identity/04-DISPOSITION.md`. Bit-identity (torch.equal) achieved only on dense fwd, diagonal fwd (realistic+near-saturation), and diagonal bwd. Other (kernel, direction, class) tuples use empirically-derived mults 2-20000 with bd-tracked Phase 7 remediation.
 - Phase 4 D-43 (helper byte-uniformity): preserved across the 4 strict files; per-call `h_scale_mult` arguments diverge per cluster.
 - Phase 4 root cause: TF32 reduction-order non-associativity (`gru-triton-rwm`, Phase 2 Option C) surfacing at the in-kernel-quant boundary. Reproducer at `.planning/debug/repro_monarch_rounding.py`.
+- [Phase 7]: D-10 — all 14 open bd issues closed by disposition bucket (3 FIX / 9 ACCEPTED-DIVERGENCE / 2 INDIVIDUAL); `bd ready` empty.
+- [Phase 7]: D-09 — git-log test-before-fix audit complete (`07-git-log-audit.txt`); Phases 1-3 produced zero bug-fix commits so no ordering gap; no history rewritten.
 
 ### Pending Todos
 
@@ -73,27 +76,19 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ### Blockers/Concerns
 
-- 9 open bd issues from Phase 4 are kernel-investigation or process tickets; none block Phase 5 entry. Tracked for Phase 7 audit report.
+- None. All 14 carry-forward bd issues were triaged and CLOSED in Phase 7 Plan 07-03 (3 FIX / 9 ACCEPTED-DIVERGENCE / 2 INDIVIDUAL). `bd ready` is empty.
 
 ## Deferred Items
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| Phase 4 carry-forward | `gru-triton-lht` (F-04-05-A dense bwd, SUPERSEDED by mjy) | open, Phase 7 | 2026-05-14 |
-| Phase 4 carry-forward | `gru-triton-5rk` (F-04-05-B butterfly fwd, EXTENDED by lqk) | open, Phase 7 | 2026-05-14 |
-| Phase 4 carry-forward | `gru-triton-u00` (F-04-05-D parallel-execution race) | open, Phase 7 / Phase 5 process | 2026-05-14 |
-| Phase 4 verifier-new | `gru-triton-in0` (F-04-VERIFIER-A monarch fwd) | open, Phase 7 | 2026-05-14 |
-| Phase 4 verifier-new | `gru-triton-q3k` (F-04-VERIFIER-B monarch bwd) | open, Phase 7 | 2026-05-14 |
-| Phase 4 verifier-new | `gru-triton-mjy` (F-04-VERIFIER-C dense bwd) | open, Phase 7 | 2026-05-14 |
-| Phase 4 verifier-new | `gru-triton-lqk` (F-04-VERIFIER-D butterfly bwd) | open, Phase 7 | 2026-05-14 |
-| Phase 4 verifier-new | `gru-triton-fpl` (F-04-VERIFIER-E diagonal fwd large-magnitude) | open, Phase 7 | 2026-05-14 |
-| Phase 4 verifier-new | `gru-triton-e0l` (F-04-VERIFIER-F monarch bwd HW-limit) | open, Phase 7 | 2026-05-14 |
-| Pre-existing carry | `gru-triton-e7t` (F-02-02-A diagonal bwd long-T) | open, Phase 7 | 2026-05-13 |
-| Pre-existing carry | `gru-triton-4m6` (mypy/ruff debt) | open, Phase 7 | 2026-05-13 |
-| Pre-existing carry | `gru-triton-6dz` (Phase 2 strict-tier small-shape failures) | open, Phase 7 | 2026-05-13 |
+| v2 kernel hardening | `KRN-01` (gru-triton-e0l monarch-bwd kernel-tiling redesign for consumer-GPU SMEM) | deferred to v2, bd ref recorded in REQUIREMENTS.md | 2026-05-15 |
+| v2 kernel hardening | `KRN-02` (input_precision='ieee' TF32-elimination — resolves the 9 ACCEPTED-DIVERGENCE issues at root) | deferred to v2, bd refs recorded in REQUIREMENTS.md | 2026-05-15 |
+
+_All 14 Phase 1-6 carry-forward bd issues are now CLOSED (Plan 07-03). The two rows above are the v2-deferred remediations recorded in REQUIREMENTS.md v2 section; their originating bd issues are CLOSED with v2 pointers, not left open._
 
 ## Session Continuity
 
-Last session: 2026-05-15T07:23:08.337Z
-Stopped at: Phase 7 context gathered
-Resuming: Run `/gsd-discuss-phase` for Phase 5 (CAL-01/02/03 — calibration + freeze lifecycle). Phase 5 inherits Phase 4's per-cluster post-freeze tolerance contract from `phases/04-quant-on-bit-identity/04-DISPOSITION.md`.
+Last session: 2026-05-15T10:51:48.751Z
+Stopped at: Completed 07-03-PLAN.md
+Resuming: Execute Phase 7 Plan 07-04 (`AUDIT-REPORT.md`, Wave 4 — the final plan). It reports the post-fix, all-14-issues-closed state and consumes `07-git-log-audit.txt` for the per-phase test-before-fix summary.

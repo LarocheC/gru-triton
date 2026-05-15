@@ -52,8 +52,8 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Findings handling & reporting (RPT)
 
-- [ ] **RPT-01**: Every mismatch surfaced during REF/TRI/STR/QNT/CAL/EDG is captured by a failing test before any fix lands.
-- [ ] **RPT-02**: Every finding has a beads issue (`bd create`) capturing root cause, fix, and regression test.
+- [x] **RPT-01**: Every mismatch surfaced during REF/TRI/STR/QNT/CAL/EDG is captured by a failing test before any fix lands.
+- [x] **RPT-02**: Every finding has a beads issue (`bd create`) capturing root cause, fix, and regression test.
 - [ ] **RPT-03**: Audit ends with a written `AUDIT-REPORT.md` summarizing what was checked, what passed, what was fixed, and any residual known-but-accepted divergences.
 
 ## v2 Requirements
@@ -133,8 +133,8 @@ Populated during roadmap creation by the roadmapper agent.
 | EDG-02 | Phase 6 | Complete |
 | EDG-03 | Phase 6 | Complete |
 | EDG-04 | Phase 6 | Complete |
-| RPT-01 | Phase 7 | Pending |
-| RPT-02 | Phase 7 | Pending |
+| RPT-01 | Phase 7 | Complete |
+| RPT-02 | Phase 7 | Complete |
 | RPT-03 | Phase 7 | Pending |
 
 **Coverage:**
