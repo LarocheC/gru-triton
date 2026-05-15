@@ -1,0 +1,135 @@
+================================================================================
+Phase 7 — git-log test-before-fix ordering audit (D-09, RPT-01)
+================================================================================
+Produced by: plan 07-03 Task 1
+Date:        2026-05-15
+Purpose:     Confirm, for every Phase 1-6 finding, that the failing-test
+             (`test(...)`) commit precedes the fix (`fix(...)`) commit in
+             git history. Where the ordering is genuinely absent, the gap is
+             RECORDED here — git history is NOT rewritten (D-09 explicit).
+             This artifact is consumed verbatim by plan 07-04 for the
+             AUDIT-REPORT per-phase summary.
+
+METHOD
+------
+- `git log --oneline --all` inspected for every `test(...)` / `fix(...)` pair.
+- Commit SHAs cited concretely; ordering verified by `git show -s --format=%ci`
+  (commit-date) where same-day pairs needed disambiguation.
+- D-37/D-50 (failing-test-before-fix two-commit discipline) was adopted in
+  Phase 4. Phases 1-3 predate it. The 9 ACCEPTED-DIVERGENCE issues + 2
+  INDIVIDUAL issues are NOT bugs-with-a-fix-commit — they are dispositioned
+  (tolerance loosening or skip), so their "fix" row is the disposition commit
+  and the "test" row is the strict-test commit that surfaced the divergence.
+
+================================================================================
+TABLE A — The 14 open bd issues (Phase 7 closure scope)
+================================================================================
+Finding / bd id       | Test commit (RED / surfacing) | Fix or disposition commit            | Ordering
+----------------------+-------------------------------+--------------------------------------+---------
+gru-triton-n20  (FIX) | be0b734 test(07-02) extend    | 65c89f8 fix(07-02) deepcopy          | OK
+                      | CAL-02 to quant_h_out         | QuantizerConfig per quantizer        |
+gru-triton-7rj  (FIX) | b87d986 test(07-01) failing   | 242a986 fix(07-01) harden gru_scan   | OK
+                      | wrapper-validation tests      | shape/dtype validation               |
+gru-triton-4m6  (FIX) | n/a — lint/type debt, no      | cf0ef0f fix(07-01) clear mypy/ruff   | N/A
+                      | behavioral RED test; the      | debt to 0/0. Verified by the         | (hygiene —
+                      | gate IS `mypy`+`ruff` 0/0     | mypy/ruff 0-error gate, not a        |  no RED
+                      |                               | pytest RED test.                     |  test
+                      |                               |                                      |  applicable)
+gru-triton-in0  (AD)  | f3e300c test(04-verifier)     | f3e300c (same commit — disposition:  | OK
+                      | A/B loosen monarch fwd/bwd    | loosen bound, not a code fix)         | (disposition)
+gru-triton-q3k  (AD)  | f3e300c test(04-verifier)     | f3e300c (same — monarch bwd          | OK
+                      | A/B loosen monarch fwd/bwd    | disposition)                         | (disposition)
+gru-triton-lqk  (AD)  | 922fbc3 / a8e5ccf             | a8e5ccf test(04-verifier) F-04-      | OK
+                      | test(04-verifier) D bump      | VERIFIER-D butterfly fwd+bwd bounds   | (disposition)
+gru-triton-5rk  (AD)  | a8ed6e8 test(02-04) butterfly | 990eb96 test(04-05) F-04-05-B loosen  | OK
+                      | strict-tier fwd parity        | butterfly fwd to < 5*h_scale          | (disposition)
+gru-triton-mjy  (AD)  | 9049ec0 test(04-verifier) C   | 9049ec0 (same — extend dense bwd     | OK
+                      | extend dense bwd bound        | bound, supersedes F-04-05-A)          | (disposition)
+gru-triton-lht  (AD)  | 91e5dc4 test(04-05) F-04-05-A | 91e5dc4 (same — loosen dense bwd      | OK
+                      | loosen dense bwd dWh_cat      | dWh_cat bound). SUPERSEDED by mjy.    | (disposition)
+gru-triton-e7t  (AD)  | a8ff41c test(02-02) strict    | 2c49c4c test(02-06) loosen slow-tier  | OK
+                      | diagonal Triton parity audit  | diagonal dbh bound to < 2e-5          | (disposition)
+gru-triton-fpl  (AD)  | 922fbc3 test(04-verifier)     | 922fbc3 (same — F-04-VERIFIER-E      | OK
+                      | D/E loosen diagonal bounds    | diagonal disposition)                 | (disposition)
+gru-triton-6dz  (AD)  | a8ed6e8 test(02-04) butterfly | 990eb96 / 5937610 / e909f74           | OK
+                      | + 3ef47ef monarch strict      | test(02-06) Option C bound loosening  | (disposition)
+gru-triton-e0l  (IND) | bf01232 test(04-verifier)     | bf01232 (same — F-04-VERIFIER-F      | OK
+                      | F skip monarch bwd HW-limited | skip via _skip_if_monarch_bwd_hw_     | (disposition —
+                      | shapes + bump bound           | limit; HW limit, no code fix)         |  skip)
+gru-triton-u00  (IND) | n/a — process finding, no     | n/a — no code change. Mitigated by   | N/A
+                      | code test                     | single-plan discipline (Phases 5-7). | (process)
+
+LEGEND: FIX = genuine bug fixed in-phase; AD = ACCEPTED-DIVERGENCE
+        (TF32 reduction-order, not code-fixed); IND = INDIVIDUAL
+        (hardware limit / process finding).
+
+================================================================================
+TABLE B — In-phase findings recorded in NN-SUMMARY files (resolved before P7)
+================================================================================
+These were FOUND and FIXED inside their own phase (already CLOSED in bd before
+Phase 7 — not part of the 14-issue closure scope, but in D-09 audit scope).
+
+Finding / bd id  | Test commit (RED)                    | Fix commit (B)                       | Ordering
+-----------------+--------------------------------------+--------------------------------------+---------
+QNT-04           | 0b6adec test(04-01) QNT-04 Commit A  | f17073f fix(quantizers) QNT-04 per-  | OK
+gru-triton-x15   | failing per-channel min_max test     | axis reduction in _update_observer   | (RED 13:02
+                 | (2026-05-14 13:02)                   | (2026-05-14 13:09)                   |  < B 13:09)
+EDG-02 / H=1     | eb7242b test(06-01-03) failing       | cca1783 fix(06-01-03) reject         | OK
+gru-triton-ehf   | regression — butterfly H=1 crashes   | butterfly H<2 in _validate_shapes    | (RED 08:24
+                 | interpreter (2026-05-15 08:24)       | (Commit B) (2026-05-15 08:32:25)     |  < B 08:32)
+EDG-02 / batch   | d6625cc test(06-01-03) B=1 + small-H | 6d09571 fix(scan_butterfly) add      | OK
+gru-triton-c2a   | sweep + butterfly batch-tiling       | intra-CTA barriers between butterfly  | (RED 08:32
+                 | finding (RED) (2026-05-15 08:32:52)  | stages (2026-05-15 08:57:21)         |  < B 08:57)
+
+================================================================================
+TABLE C — Phase 1-3 findings (predate D-37/D-50) — gap check
+================================================================================
+D-09 / Open Question 2: Phases 1-3 were executed BEFORE the D-37/D-50
+two-commit discipline was adopted (Phase 4). The question is whether any
+Phase 1-3 work has a fix-before-test ordering in history.
+
+VERDICT: NO GAP. Phases 1-3 surfaced ZERO parity bugs requiring a code fix.
+
+Evidence:
+- Phase 1 (reference-path parity vs nn.GRU): 01-SUMMARY records "304 tests
+  pass; zero parity bugs surfaced; cell parity contract held" (PROJECT.md
+  Key Decision row "Phase 1 closed"). All Phase 1 commits are `test(01-*)`
+  — there is NO `fix(01-*)` commit at all. Nothing to order.
+- Phase 2 (Triton fast-path parity): the Option C disposition (gru-triton-rwm,
+  CLOSED) is a tolerance loosening, not a code fix. Phase 2 surfaced the TF32
+  divergence family but the resolution was a documented bound change
+  (533d137 / 5937610 / e909f74 / 2c49c4c — all `test(02-06)`), not a
+  `fix(...)`. The pre-existing kernel fixes that DO appear unprefixed
+  (d8218d4 "butterfly scratch/state OOB", c001a8a "zero dWh/dbh accumulator
+  slabs", 0e26193 "persistent forward kernel barrier relaxed atomics") PREDATE
+  the audit milestone entirely — they are part of the brownfield codebase the
+  audit inspects, not Phase 2 audit findings. Phase 2's audit job was to ADD
+  regression coverage for them (TRI-05/TRI-06 tests ac56d94), which it did.
+- Phase 3 (structured PyTorch fallback parity): 03-SUMMARY records all
+  structured-variant parity tests passing; commits are all `test(03-*)`.
+  No `fix(03-*)` commit exists. Nothing to order.
+
+CONCLUSION: The "Phases 1-3 predate the discipline" risk did not materialize
+into an actual gap, because Phases 1-3 produced no bug-fix commits — they were
+pure test-addition / disposition phases. Every genuine code fix in the
+milestone (QNT-04 x15, EDG-02 ehf, EDG-02 c2a, and Phase 7's n20 + 7rj)
+landed in Phase 4 or later and strictly followed test-before-fix ordering
+(Tables A & B above). No git history was rewritten (D-09 satisfied).
+
+================================================================================
+SUMMARY
+================================================================================
+- Every Phase 1-6 finding has a documented test-before-fix ordering verdict.
+- All genuine code-fix findings (QNT-04, EDG-02 ehf, EDG-02 c2a, n20, 7rj):
+  ordering OK — RED test commit strictly precedes the fix commit.
+- 4m6 (lint debt) and u00 (process) have no behavioral RED test by nature —
+  marked N/A, not GAP. 4m6's gate is the mypy/ruff 0/0 check; u00 is a
+  process finding with no code change.
+- The 9 ACCEPTED-DIVERGENCE issues resolve via documented tolerance/skip
+  dispositions, not code fixes — their disposition commits are recorded.
+- Phases 1-3 GAP CHECK: NO GAP — those phases produced zero bug-fix commits.
+- No `git rebase` / `git commit --amend` / history-rewriting command was run.
+
+RPT-01 (failing-test-before-fix discipline) is CONFIRMED for the milestone.
+This file is ready for plan 07-04 to quote into AUDIT-REPORT.md.
+================================================================================
