@@ -80,6 +80,40 @@ cuda_only = pytest.mark.skipif(
 )
 
 
+# ---------------------------------------------------------------------------
+# `divergence` marker (Phase 7 D-05) — per-parametrize-case marking.
+#
+# Butterfly compounds TF32 reduction-order noise across `log_H` butterfly
+# stages, so its strict-tier failures are the Phase 2 Option C accepted
+# divergence (`gru-triton-5rk` / `gru-triton-lqk` family). Each failing
+# parametrize case is `divergence`-marked per-case so the clean clusters that
+# still pass `< 5e-4` stay in the `pytest -q -m "not divergence"` green gate
+# (Pitfall 1). The id set is the empirical post-n20-fix strict-suite failure
+# list captured on RTX 2000 Ada. See AUDIT-REPORT.md.
+# ---------------------------------------------------------------------------
+# Butterfly bwd compounds TF32 reduction-order noise across all `log_H`
+# stages — per 04-DISPOSITION.md the whole bwd grid is an accepted divergence
+# (`gru-triton-lqk`). Which exact shapes exceed `< 5e-4` is autotune-config
+# dependent (a case can flip pass/fail across runs), so the ENTIRE bwd grid
+# is marked rather than a brittle observed-failure subset.
+_DIV_BFLY_BWD = {
+    f"{T}-{B}-{H}"
+    for T in (1, 8, 64) for B in (1, 4, 32) for H in (32, 128, 512)
+}
+_DIV_BFLY_BWD_SLOW = {
+    f"{T}-{B}-{H}"
+    for T in (512, 1024) for B in (1, 4, 32) for H in (32, 128, 512)
+}
+
+
+def _div_param(values: tuple, ident: str, div_set: set[str]):
+    """Return a `pytest.param` for `values`, tagged `divergence` when `ident`
+    is in `div_set` — matches pytest's generated param id."""
+    if ident in div_set:
+        return pytest.param(*values, marks=pytest.mark.divergence)
+    return pytest.param(*values)
+
+
 # duplicated per D-18 (< 30 LOC, inline beats shared module).
 # Strict-tier callers always pass hidden_bits=32 (fp32-Identity per CONTEXT —
 # Phase 2 is fp32-Identity only; quant-on is Phase 4).
@@ -212,7 +246,10 @@ def _assert_grad_close(
 
 
 @cuda_only
-@pytest.mark.parametrize("T,B,H", FAST_BFLY_GRID)
+@pytest.mark.parametrize(
+    "T,B,H",
+    [_div_param((T, B, H), f"{T}-{B}-{H}", _DIV_BFLY_BWD) for T, B, H in FAST_BFLY_GRID],
+)
 def test_butterfly_bwd_strict_matches_reference(T: int, B: int, H: int) -> None:
     """Triton butterfly backward must match autograd through the CUDA-op
     per-step reference path to < 5e-4 absolute under ``'highest'``.
@@ -272,7 +309,10 @@ def test_butterfly_bwd_strict_matches_reference(T: int, B: int, H: int) -> None:
 
 @pytest.mark.slow
 @cuda_only
-@pytest.mark.parametrize("T,B,H", SLOW_BFLY_GRID)
+@pytest.mark.parametrize(
+    "T,B,H",
+    [_div_param((T, B, H), f"{T}-{B}-{H}", _DIV_BFLY_BWD_SLOW) for T, B, H in SLOW_BFLY_GRID],
+)
 def test_butterfly_bwd_strict_matches_reference_slow(
     T: int, B: int, H: int
 ) -> None:

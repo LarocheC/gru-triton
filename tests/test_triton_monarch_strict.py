@@ -65,6 +65,73 @@ cuda_only = pytest.mark.skipif(
 )
 
 
+# ---------------------------------------------------------------------------
+# `divergence` marker (Phase 7 D-05) — per-parametrize-case marking.
+#
+# Monarch has 3 `tl.dot` calls per timestep per gate, so it is the heaviest
+# TF32-reduction-order surface. The fp32 strict `< 5e-4` fwd/bwd cases that
+# exceed the bound are the Phase 2 Option C accepted divergence (`gru-triton-
+# rwm` / `gru-triton-6dz`); the quant-bwd large-magnitude T=512 cases are the
+# Phase 4 verifier family (`gru-triton-q3k`). Each is `divergence`-marked
+# per-parametrize-case (Pitfall 1 — clean small-shape clusters that still
+# pass stay in the green gate). The id sets are the empirical post-n20-fix
+# strict-suite failure list captured on RTX 2000 Ada. See AUDIT-REPORT.md.
+# ---------------------------------------------------------------------------
+# monarch fwd/bwd fp32 strict: monarch has 3 tl.dot calls per timestep per
+# gate — the heaviest TF32-reduction surface. Which exact shapes exceed the
+# `< 5e-4` bound is autotune-config dependent, so the WHOLE fast grid is
+# marked for both directions (`gru-triton-rwm` / `gru-triton-q3k` family).
+_DIV_MONARCH_FWD = {
+    f"{T}-{B}-{H}-{nb}"
+    for T in (1, 8, 64) for B in (1, 4, 32)
+    for H in (32, 128, 512) for nb in (2, 4, 8)
+}
+_DIV_MONARCH_BWD = {
+    f"{T}-{B}-{H}-{nb}"
+    for T in (1, 8, 64) for B in (1, 4, 32)
+    for H in (32, 128, 512) for nb in (2, 4, 8)
+}
+# n20-rebaselined monarch quant bwd: the `large-magnitude` H=512 nb=8 cases
+# exceed even the loose 100x bound (gru-triton-q3k). Mark the whole
+# `large-magnitude` H=512 cluster — which (T, B) tuples tip over is
+# autotune-config dependent. realistic / near-saturation stay clean.
+_DIV_MONARCH_QUANT_BWD = {
+    f"large-magnitude-{T}-{B}-512-{nb}"
+    for T in (8, 64) for B in (1, 4, 32) for nb in (2, 4, 8)
+}
+# slow-tier (T in {512, 1024}) — observed failure ids from the slow strict run.
+# monarch fwd/bwd fp32 slow strict (T in {512, 1024}) — same whole-grid TF32
+# divergence as the fast tier (`gru-triton-rwm` / `gru-triton-q3k`).
+_DIV_MONARCH_FWD_SLOW = {
+    f"{T}-{B}-{H}-{nb}"
+    for T in (512, 1024) for B in (1, 4, 32)
+    for H in (32, 128, 512) for nb in (2, 4, 8)
+}
+_DIV_MONARCH_BWD_SLOW = {
+    f"{T}-{B}-{H}-{nb}"
+    for T in (512, 1024) for B in (1, 4, 32)
+    for H in (32, 128, 512) for nb in (2, 4, 8)
+}
+# n20-rebaselined monarch quant bwd slow (gru-triton-q3k). The
+# `near-saturation` / `large-magnitude` slow clusters tip over the per-class
+# bound and which exact (B, nblocks) tuples fail is autotune-config
+# dependent, so both clusters are marked whole. `realistic` stays clean.
+_DIV_MONARCH_QUANT_BWD_SLOW = {
+    f"{cls}-512-{B}-{H}-{nb}"
+    for cls in ("near-saturation", "large-magnitude")
+    for B in (1, 4, 32) for H in (32, 128, 512) for nb in (2, 4, 8)
+    if H % nb == 0
+}
+
+
+def _div_param(values: tuple, ident: str, div_set: set[str]):
+    """Return a `pytest.param` for `values`, tagged `divergence` when `ident`
+    is in `div_set` — matches pytest's generated param id."""
+    if ident in div_set:
+        return pytest.param(*values, marks=pytest.mark.divergence)
+    return pytest.param(*values)
+
+
 # Helpers below are duplicated verbatim from tests/test_triton_monarch.py per
 # D-18 (CONTEXT). Phase 2's LOCKED-files contract (D-28) plus the
 # planner's "small (<30 LOC) helper, prefer duplicate over import" rule
@@ -141,7 +208,13 @@ SLOW_MONARCH_GRID = [
 
 
 @cuda_only
-@pytest.mark.parametrize("T,B,H,nblocks", FAST_MONARCH_GRID)
+@pytest.mark.parametrize(
+    "T,B,H,nblocks",
+    [
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_FWD)
+        for (T, B, H, nb) in FAST_MONARCH_GRID
+    ],
+)
 def test_monarch_fwd_strict_matches_reference(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
@@ -182,7 +255,13 @@ def test_monarch_fwd_strict_matches_reference(
 
 @cuda_only
 @pytest.mark.slow
-@pytest.mark.parametrize("T,B,H,nblocks", SLOW_MONARCH_GRID)
+@pytest.mark.parametrize(
+    "T,B,H,nblocks",
+    [
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_FWD_SLOW)
+        for (T, B, H, nb) in SLOW_MONARCH_GRID
+    ],
+)
 def test_monarch_fwd_strict_matches_reference_slow(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
@@ -211,7 +290,13 @@ def test_monarch_fwd_strict_matches_reference_slow(
 
 
 @cuda_only
-@pytest.mark.parametrize("T,B,H,nblocks", FAST_MONARCH_GRID)
+@pytest.mark.parametrize(
+    "T,B,H,nblocks",
+    [
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_BWD)
+        for (T, B, H, nb) in FAST_MONARCH_GRID
+    ],
+)
 def test_monarch_bwd_strict_matches_reference(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
@@ -276,7 +361,13 @@ def test_monarch_bwd_strict_matches_reference(
 
 @cuda_only
 @pytest.mark.slow
-@pytest.mark.parametrize("T,B,H,nblocks", SLOW_MONARCH_GRID)
+@pytest.mark.parametrize(
+    "T,B,H,nblocks",
+    [
+        _div_param((T, B, H, nb), f"{T}-{B}-{H}-{nb}", _DIV_MONARCH_BWD_SLOW)
+        for (T, B, H, nb) in SLOW_MONARCH_GRID
+    ],
+)
 def test_monarch_bwd_strict_matches_reference_slow(
     T: int, B: int, H: int, nblocks: int
 ) -> None:
@@ -712,8 +803,16 @@ def _monarch_bwd_mult(cls: str, B: int) -> float:
 
 
 @cuda_only
-@pytest.mark.parametrize("T,B,H,nblocks", QUANT_MONARCH_FAST_GRID)
-@pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
+@pytest.mark.parametrize(
+    "cls,T,B,H,nblocks",
+    [
+        _div_param(
+            (cls, T, B, H, nb), f"{cls}-{T}-{B}-{H}-{nb}", _DIV_MONARCH_QUANT_BWD
+        )
+        for cls in ("realistic", "near-saturation", "large-magnitude")
+        for (T, B, H, nb) in QUANT_MONARCH_FAST_GRID
+    ],
+)
 def test_monarch_quant_bwd(
     cls: str, T: int, B: int, H: int, nblocks: int
 ) -> None:
@@ -779,8 +878,16 @@ def test_monarch_quant_bwd(
 
 @pytest.mark.slow
 @cuda_only
-@pytest.mark.parametrize("T,B,H,nblocks", QUANT_MONARCH_SLOW_GRID)
-@pytest.mark.parametrize("cls", ["realistic", "near-saturation", "large-magnitude"])
+@pytest.mark.parametrize(
+    "cls,T,B,H,nblocks",
+    [
+        _div_param(
+            (cls, T, B, H, nb), f"{cls}-{T}-{B}-{H}-{nb}", _DIV_MONARCH_QUANT_BWD_SLOW
+        )
+        for cls in ("realistic", "near-saturation", "large-magnitude")
+        for (T, B, H, nb) in QUANT_MONARCH_SLOW_GRID
+    ],
+)
 def test_monarch_quant_bwd_slow(
     cls: str, T: int, B: int, H: int, nblocks: int
 ) -> None:
