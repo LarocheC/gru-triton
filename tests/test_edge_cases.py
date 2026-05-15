@@ -410,3 +410,132 @@ def test_t1_backward_parity(path: str, T: int, B: int, H: int) -> None:
     _gate_off(path)
     _maybe_skip_monarch_bwd(path, T, B, H)
     _run_path_vs_reference(path, T, B, H, backward=True)
+
+
+# ===========================================================================
+# Task 3 — EDG-02: B=1 + H in {1,2} BLOCK-size sweep.
+# ===========================================================================
+#
+# The most bug-likely task per CONCERNS.md — the B=1 / small-H corner is
+# exactly where Triton BLOCK assumptions break (butterfly B%BLOCK_B partial
+# tile, monarch non-pow2 BLKSZ pad-to-pow2). Any BLOCK-assumption failure
+# surfaced here is a REAL BUG, fixed in-phase (D-04): Commit A failing test
+# -> bd issue -> Commit B fix. NO @pytest.mark.xfail. A HW-limit skip
+# (_skip_if_monarch_bwd_hw_limit) is distinct from a BLOCK-assumption bug.
+#
+# Every Task-3 shape is small (H<=8, B<=33); with default block_b=8 /
+# block_oh=128 the persistent-grid product cdiv(B,8)*cdiv(H,128) is 1, far
+# below sm_count (~24 on RTX 2000 Ada). NO Task-3 shape trips the SM-count
+# deadlock guard, so this task adds no speculative pytest.raises(RuntimeError).
+
+# (T, B, H): B=1 single-batch x H in {1,2}, plus B=1/H=8 and B=4/H in {1,2}
+# so the B and H degeneracies are isolated and crossed.
+_B1_SMALL_H_GRID = [
+    (8, 1, 1),
+    (8, 1, 2),
+    (8, 1, 8),
+    (8, 4, 1),
+    (8, 4, 2),
+]
+
+
+@pytest.mark.parametrize("path", ALL_PATHS)
+@pytest.mark.parametrize("T,B,H", _B1_SMALL_H_GRID)
+def test_b1_small_h_parity(path: str, T: int, B: int, H: int) -> None:
+    """B=1 and H in {1,2} produce correct output for every path
+    (EDG-02, ROADMAP SC#2).
+
+    Explicitly targets the CONCERNS.md BLOCK-size failure modes: butterfly
+    ``B % BLOCK_B`` partial-tile OOB, monarch non-pow2 ``BLKSZ`` pad-to-pow2
+    mask fragility at small H. Any BLOCK-assumption failure surfaced is a
+    real bug — fixed in-phase per D-04, never silenced with xfail.
+
+    Butterfly at H=1 is excluded from this parity grid: a size-1 butterfly
+    factorization has 0 stages and is mathematically undefined. The
+    ``gru_qat`` validation rejects it at construction with a clear
+    ``ValueError`` — that contract is pinned by the dedicated regression
+    ``test_butterfly_h1_raises_valueerror`` (bd gru-triton-65n) rather
+    than crashing this parity sweep.
+    """
+    _gate_off(path)
+    if path == "butterfly_triton" and H < 2:
+        pytest.skip(
+            "butterfly H=1 is rejected at construction (size-1 factorization "
+            "undefined); see test_butterfly_h1_raises_valueerror"
+        )
+    _run_path_vs_reference(path, T, B, H, backward=False)
+
+
+def test_butterfly_h1_raises_valueerror() -> None:
+    """Butterfly hidden at H=1 must raise a clear ValueError at
+    construction — NOT crash the interpreter (EDG-02 / D-04 finding).
+
+    Surfaced by the Task-3 B=1/small-H sweep: a butterfly with
+    ``hidden_size=1`` reaches ``torch_structured``'s ``butterfly_multiply``
+    CUDA op, which divides by ``n // 2 == 0`` and raises a fatal
+    ``Floating-point exception`` that aborts the whole Python process.
+
+    A size-1 butterfly factorization has ``log2(1) == 0`` stages and is
+    mathematically undefined — analogous to circulant's existing
+    power-of-2 guard (``structure.py:95``). The fix rejects
+    ``butterfly`` with ``in_features < 2`` in ``_validate_shapes`` so the
+    error surfaces as a clean ``ValueError`` at ``GRULayer`` construction,
+    long before any kernel launch.
+
+    bd gru-triton-65n. This is the Commit-A regression test: it fails
+    cleanly (DID NOT RAISE) before the fix and passes after.
+    """
+    rec = _fp32_recipe()
+    with pytest.raises(ValueError, match="butterfly"):
+        GRULayer(
+            1, 1, recipe=rec, gate_layout="fused",
+            structure_hidden=StructureConfig(kind="butterfly"),
+            use_triton=True,
+        )
+
+
+@cuda_only
+@pytest.mark.parametrize("B", [1, 3, 5, 7, 9, 17, 33])
+def test_butterfly_partial_batch_tile(B: int) -> None:
+    """Butterfly partial-last-batch-tile sweep at (T=16, H=512)
+    (EDG-02, ROADMAP SC#2).
+
+    The CONCERNS.md-suggested butterfly sweep covering the
+    ``B % BLOCK_B != 0`` partial-last-tile corner — the butterfly OOB fix
+    ``d8218d4`` shipped WITHOUT a regression test. B=1 is the extreme;
+    odd B values exercise non-aligned final tiles. Parity at < 5e-4 (the
+    ``tl.dot`` tier), per-batch error idiom so a grid bug localizes.
+    """
+    pytest.importorskip("triton")
+    pytest.importorskip("torch_structured")
+    torch.manual_seed(0)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+    T, H = 16, 512
+    in_size = H
+
+    ref_layer = _make_layer("butterfly_triton", in_size, H).to(device)
+    got_layer = _make_layer("butterfly_triton", in_size, H).to(device)
+    got_layer.load_state_dict(ref_layer.state_dict())
+    ref_layer.use_triton = False  # per-step reference
+
+    x = torch.randn(T, B, in_size, device=device)
+    ref_out, ref_hT = ref_layer(x.clone())
+    tri_out, tri_hT = got_layer(x.clone())
+
+    assert torch.isfinite(tri_out).all(), f"butterfly out non-finite (B={B})"
+    assert tuple(tri_out.shape) == (T, B, H), (
+        f"butterfly out shape {tuple(tri_out.shape)} != {(T, B, H)} (B={B})"
+    )
+    # Per-batch error inspection: localizes a partial-tile grid bug to a
+    # specific pid_b (TESTING.md "Per-batch error inspection").
+    rel_per_b = [
+        _rel(ref_out[:, b], tri_out[:, b]) for b in range(B)
+    ]
+    worst = max(rel_per_b)
+    assert worst < 5e-4, (
+        f"butterfly partial-tile out rel diff {worst:.4e} >= 5e-4 (B={B}); "
+        f"per-batch rel={[f'{r:.2e}' for r in rel_per_b]}"
+    )
+    rel_h = _rel(ref_hT, tri_hT)
+    assert rel_h < 5e-4, f"butterfly partial-tile h_T rel diff {rel_h:.4e} (B={B})"
