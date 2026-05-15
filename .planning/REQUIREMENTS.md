@@ -52,9 +52,9 @@ Requirements for this audit milestone. Each maps to roadmap phases.
 
 ### Findings handling & reporting (RPT)
 
-- [x] **RPT-01**: Every mismatch surfaced during REF/TRI/STR/QNT/CAL/EDG is captured by a failing test before any fix lands.
-- [x] **RPT-02**: Every finding has a beads issue (`bd create`) capturing root cause, fix, and regression test.
-- [ ] **RPT-03**: Audit ends with a written `AUDIT-REPORT.md` summarizing what was checked, what passed, what was fixed, and any residual known-but-accepted divergences.
+- [x] **RPT-01**: Every mismatch surfaced during REF/TRI/STR/QNT/CAL/EDG is captured by a failing test before any fix lands. ✓ 2026-05-15 (git-log test-before-fix audit done — `07-git-log-audit.txt`; every code-fix finding has RED-before-fix ordering; Phases 1-3 gap-checked, no gap; gaps documented, no history rewritten)
+- [x] **RPT-02**: Every finding has a beads issue (`bd create`) capturing root cause, fix, and regression test. ✓ 2026-05-15 (all 14 carry-forward bd issues closed with resolution notes — 3 FIX / 9 ACCEPTED-DIVERGENCE / 2 INDIVIDUAL; `bd ready` empty)
+- [x] **RPT-03**: Audit ends with a written `AUDIT-REPORT.md` summarizing what was checked, what passed, what was fixed, and any residual known-but-accepted divergences. ✓ 2026-05-15 (`AUDIT-REPORT.md` authored at repo root — 4 D-08 sections, 28-requirement table, consolidated TF32 divergence entry, criterion-#3 reinterpretation, 14 finding-to-bd pointers)
 
 ## v2 Requirements
 
@@ -135,7 +135,7 @@ Populated during roadmap creation by the roadmapper agent.
 | EDG-04 | Phase 6 | Complete |
 | RPT-01 | Phase 7 | Complete |
 | RPT-02 | Phase 7 | Complete |
-| RPT-03 | Phase 7 | Pending |
+| RPT-03 | Phase 7 | Complete |
 
 **Coverage:**
 - v1 requirements: 28 total
