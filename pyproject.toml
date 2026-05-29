@@ -44,12 +44,10 @@ Issues = "https://github.com/LarocheC/gru-triton/issues"
 
 [project.optional-dependencies]
 triton = ["triton>=2.2"]
-# Structured-matrix support (Monarch / Butterfly / LDR) additionally needs
-# `torch-structured`, which is git-only and not on PyPI, so it cannot be
-# declared as a dependency here (PyPI rejects URL deps). Install it manually:
-#   pip install git+https://github.com/LarocheC/torch-structured@v0.4.0
-# structure.py imports it lazily, so dense-only usage (kind="dense") and the
-# diagonal/circulant kinds work without it.
+# Structured-matrix support (Monarch / Butterfly / LDR). torch-structured is
+# on PyPI as of 1.2.1; structure.py imports it lazily, so dense-only usage
+# (kind="dense") and the diagonal/circulant kinds work without this extra.
+structured = ["torch-structured>=1.2.1"]
 dev = [
     "pytest>=7",
     "pytest-xdist>=3",

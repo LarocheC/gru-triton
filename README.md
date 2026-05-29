@@ -26,24 +26,17 @@ hidden weights and a multi-step persistent Triton kernel.
 ## Install
 
 ```bash
-pip install gru-qat              # core: dense reference + QAT (CPU/CUDA)
-pip install "gru-qat[triton]"    # + persistent Triton fast path (CUDA)
+pip install gru-qat                 # core: dense reference + QAT (CPU/CUDA)
+pip install "gru-qat[triton]"       # + persistent Triton fast path (CUDA)
+pip install "gru-qat[structured]"   # + Monarch / Butterfly / LDR (torch-structured)
 ```
 
-The core package depends only on `torch` and `numpy`. The Triton fast
-path is an optional `[triton]` extra — the dense reference path and dense
-QAT work without it.
-
-Structured hidden weights (Monarch / Butterfly / LDR) additionally need
-[`torch-structured`](https://github.com/LarocheC/torch-structured), which
-is git-only (not on PyPI), so install it separately:
-
-```bash
-pip install git+https://github.com/LarocheC/torch-structured@v0.4.0
-```
-
-`structure.py` imports it lazily, so dense-only usage (`kind="dense"`) and
-the diagonal/circulant kinds never touch it.
+The core package depends only on `torch` and `numpy`. `triton` and
+[`torch-structured`](https://pypi.org/project/torch-structured/) are
+optional extras — the dense reference path, dense QAT, and the
+diagonal/circulant kinds work without either. `structure.py` imports
+`torch-structured` lazily, so `kind="dense"` never touches it. The
+`structured` extra requires `torch-structured>=1.2.1`.
 
 ### From source (development)
 
