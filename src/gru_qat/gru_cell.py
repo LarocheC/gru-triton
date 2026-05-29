@@ -463,6 +463,45 @@ class GRUCellQuant(nn.Module):
         # FakeQuantize is an nn.Module; __call__ is typed Any in the stubs.
         return cast(torch.Tensor, self.quant_h_out(h_new))
 
+    def structured_input_projection(self, x_seq: torch.Tensor) -> torch.Tensor:
+        """Structured analog of ``input_projection`` for the whole sequence.
+
+        The input projection ``W_i·x`` is identical at every timestep (it's
+        not part of the recurrence), so it can be hoisted out of the time
+        loop regardless of whether the input weight is dense or structured.
+        This runs the three per-gate structured input submodules over the
+        entire ``[T, B, in]`` sequence in one batched call each (flattening
+        T·B into the batch axis so square-only / reshaping kinds don't care
+        about the time dim), applies the output-side fake-quant, adds bias,
+        and concatenates into the dense ``[T, B, 3*hidden]`` tensor the
+        Triton hidden kernel consumes. The math matches ``step_structured``'s
+        input side (lines wired identically) — but batched.
+
+        Like ``input_projection``, ``quant_x`` and the output-side
+        ``quant_struct_Wi_*`` run once over the full sequence instead of per
+        step: in dynamic mode that means one scale across T (a deliberate,
+        documented behaviour change shared with the dense pre-batch path).
+        In the frozen regime the kernel actually runs in, scales are fixed,
+        so this is identical to the per-step structured path.
+        """
+        if self._input_dense:
+            raise RuntimeError(
+                "structured_input_projection() requires a structured input "
+                "side; use input_projection() / quantize_input_weights() for "
+                "the dense path."
+            )
+        T, B, _ = x_seq.shape
+        xq = self.quant_x(x_seq).reshape(T * B, self.input_size)
+        gi_r = self.quant_struct_Wi_r(self.struct_Wi_r(xq))
+        gi_z = self.quant_struct_Wi_z(self.struct_Wi_z(xq))
+        gi_n = self.quant_struct_Wi_n(self.struct_Wi_n(xq))
+        if self.b_ir is not None:
+            gi_r = gi_r + self.b_ir
+            gi_z = gi_z + self.b_iz
+            gi_n = gi_n + self.b_in
+        gi = torch.cat([gi_r, gi_z, gi_n], dim=-1)  # [T*B, 3H]
+        return gi.reshape(T, B, 3 * self.hidden_size)
+
     def forward(
         self, x: torch.Tensor, h: torch.Tensor
     ) -> torch.Tensor:

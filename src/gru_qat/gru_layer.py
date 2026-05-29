@@ -86,9 +86,9 @@ class GRULayer(nn.Module):
             )
         self.pre_batch_input = pre_batch_input
 
-        # Fast-path dispatch eligibility: input must be dense, gate
-        # layout must be 'fused' (so the input projection produces a
-        # [T, B, 3H] tensor), and the hidden side must be one of:
+        # Fast-path dispatch eligibility: gate layout must be 'fused' (so
+        # the input projection produces a [T, B, 3H] tensor), and the
+        # hidden side must be one of:
         # - "diagonal": uses a persistent Triton kernel; the recurrence
         #   is fully pointwise across H so each program owns a slab and
         #   needs no cross-CTA barrier.
@@ -98,10 +98,17 @@ class GRULayer(nn.Module):
         #   no multi-step Triton fusion). The flag is named ``use_triton``
         #   for symmetry with the monarch path even though butterfly
         #   doesn't actually use a Triton kernel.
+        #
+        # The input side may be dense OR structured: the input projection
+        # W_i·x is identical across timesteps (not part of the recurrence),
+        # so it's hoisted out as a single batched GEMM — dense via
+        # ``quantize_input_weights`` + F.linear, structured via
+        # ``cell.structured_input_projection`` — and the resulting dense
+        # [T, B, 3H] gi is streamed into the hidden kernel either way. The
+        # kernel never sees the input parameterization.
         kind = structure_hidden.kind if structure_hidden is not None else None
         self._fast_dispatch_eligible = (
-            structure_input is None
-            and kind in ("diagonal", "monarch", "butterfly")
+            kind in ("diagonal", "monarch", "butterfly")
             and gate_layout == "fused"
         )
         self._dispatch_kind: str | None = kind if self._fast_dispatch_eligible else None
@@ -111,8 +118,8 @@ class GRULayer(nn.Module):
             self.use_triton = bool(use_triton)
             if self.use_triton and not self._fast_dispatch_eligible:
                 raise ValueError(
-                    "use_triton=True requires structure_input=None, "
-                    "structure_hidden.kind in {'diagonal', 'monarch', 'butterfly'}, "
+                    "use_triton=True requires "
+                    "structure_hidden.kind in {'diagonal', 'monarch', 'butterfly'} "
                     "and gate_layout='fused'."
                 )
         # When compile_step is True, wrap the per-step body in torch.compile
@@ -227,17 +234,25 @@ class GRULayer(nn.Module):
     def _forward_fast_dispatch(
         self, x: torch.Tensor, h0: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dispatch for structured-hidden + dense-input fast paths.
+        """Dispatch for structured-hidden fast paths (dense or structured
+        input).
 
-        Both monarch and butterfly share the input projection setup
-        (xq via quant_x, then F.linear with the dense input weights)
-        and the QAT param extraction. They differ only in the scan
-        backend used for the hidden recurrence.
+        All of monarch / butterfly / diagonal share the input projection
+        setup and the QAT param extraction, differing only in the scan
+        backend used for the hidden recurrence. The input projection is
+        hoisted to a single batched GEMM — identical across timesteps — and
+        produces the dense ``gi: [T, B, 3*hidden]`` the kernel consumes:
+        a dense input weight goes through ``quantize_input_weights`` +
+        F.linear; a structured input weight goes through the equivalent
+        batched ``cell.structured_input_projection``.
         """
-        # Quantize the input: quant_x runs once on the full sequence.
-        xq = self.cell.quant_x(x)
-        Wi_cat, bi_cat = self.cell.quantize_input_weights()
-        gi = nn.functional.linear(xq, Wi_cat, bi_cat)  # [T, B, 3*hidden]
+        if self.cell._input_dense:
+            # Quantize the input: quant_x runs once on the full sequence.
+            xq = self.cell.quant_x(x)
+            Wi_cat, bi_cat = self.cell.quantize_input_weights()
+            gi = nn.functional.linear(xq, Wi_cat, bi_cat)  # [T, B, 3*hidden]
+        else:
+            gi = self.cell.structured_input_projection(x)  # [T, B, 3*hidden]
 
         h_in_q = _extract_h_quant_params(self.cell.quant_h_in)
         h_out_q = _extract_h_quant_params(self.cell.quant_h_out)

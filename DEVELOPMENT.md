@@ -109,6 +109,14 @@ needed.
     else `cell.step(x_t, h, w)`.
   - Structured: `cell.step_structured(x_t, h)`.
   - Triton fast path: `_forward_fast_dispatch` when `use_triton=True`.
+    Eligible when `gate_layout="fused"` and the hidden kind is
+    `diagonal`/`monarch`/`butterfly`. The input side may be **dense or
+    structured**: the input projection `W_i·x` is invariant across
+    timesteps, so it's hoisted to a single batched GEMM (dense via
+    `quantize_input_weights`, structured via
+    `cell.structured_input_projection`) and the resulting dense
+    `gi:[T,B,3H]` is streamed into the hidden kernel — the kernel never
+    sees the input parameterization.
 - `calibrate(module, loader, n_batches)` switches activation
   quantizers to `min_max`, runs forwards, returns stats summary.
   `freeze_all(module)` locks scales for inference.
@@ -152,10 +160,13 @@ Extension to the phase-5 work, not part of the original plan:
 - `structure.py`: `StructureConfig(kind, nblocks, ...)` and
   `make_structured_linear` factory. Wraps `torch-structured`'s
   primitives plus thin local Diagonal and Circulant layers.
-- Cell: optional `structure_input` / `structure_hidden`. Structured
-  mode runs `step_structured` per timestep with the structured linear
+- Cell: optional `structure_input` / `structure_hidden`. The reference
+  path runs `step_structured` per timestep with the structured linear
   modules in place of dense weights. Per-gate output-side fake-quant
-  replaces per-row weight quant.
+  replaces per-row weight quant. A structured *input* no longer disables
+  the Triton path — its projection is hoisted batched (see Phase 4 fast
+  path) so a structured-input + monarch/diagonal-hidden layer still runs
+  through the kernel.
 - Triton kernels for Diagonal, Monarch and Butterfly (Circulant / LDR
   fall back to the per-step PyTorch path).
 - Tests: `test_structure.py`, `test_triton_diagonal.py`,
