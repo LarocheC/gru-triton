@@ -1,19 +1,55 @@
 [project]
 name = "gru-qat"
 version = "0.0.1"
-description = "Pluggable QAT and quantized inference for GRU"
+description = "Pluggable QAT and quantized inference for GRU, with structured-matrix hidden weights and persistent Triton kernels"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Clement Laroche" }]
+keywords = [
+    "gru",
+    "rnn",
+    "quantization",
+    "qat",
+    "quantization-aware-training",
+    "triton",
+    "pytorch",
+    "structured-matrices",
+    "int8",
+    "int4",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
     "torch>=2.2",
     "numpy>=1.24",
 ]
 
+[project.urls]
+Homepage = "https://github.com/LarocheC/gru-triton"
+Repository = "https://github.com/LarocheC/gru-triton"
+Issues = "https://github.com/LarocheC/gru-triton/issues"
+
 [project.optional-dependencies]
 triton = ["triton>=2.2"]
-# The 'structured' extra installs torch-structured from a pinned git tag
-# (Monarch/Butterfly/LDR support). structure.py imports it lazily, so
-# dense-only usage (kind="dense") works without this extra.
-structured = ["torch-structured @ git+https://github.com/LarocheC/torch-structured@v0.4.0"]
+# Structured-matrix support (Monarch / Butterfly / LDR) additionally needs
+# `torch-structured`, which is git-only and not on PyPI, so it cannot be
+# declared as a dependency here (PyPI rejects URL deps). Install it manually:
+#   pip install git+https://github.com/LarocheC/torch-structured@v0.4.0
+# structure.py imports it lazily, so dense-only usage (kind="dense") and the
+# diagonal/circulant kinds work without it.
 dev = [
     "pytest>=7",
     "pytest-xdist>=3",

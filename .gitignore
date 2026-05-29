@@ -5,6 +5,11 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Build / packaging artifacts
+/dist/
+/build/
+*.egg-info/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

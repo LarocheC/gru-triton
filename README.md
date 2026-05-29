@@ -23,19 +23,34 @@ hidden weights and a multi-step persistent Triton kernel.
 2. [`DEVELOPMENT.md`](./DEVELOPMENT.md) — file map, phase status,
    bench numbers, upgrade pathways.
 
-## Quick start
+## Install
+
+```bash
+pip install gru-qat              # core: dense reference + QAT (CPU/CUDA)
+pip install "gru-qat[triton]"    # + persistent Triton fast path (CUDA)
+```
+
+The core package depends only on `torch` and `numpy`. The Triton fast
+path is an optional `[triton]` extra — the dense reference path and dense
+QAT work without it.
+
+Structured hidden weights (Monarch / Butterfly / LDR) additionally need
+[`torch-structured`](https://github.com/LarocheC/torch-structured), which
+is git-only (not on PyPI), so install it separately:
+
+```bash
+pip install git+https://github.com/LarocheC/torch-structured@v0.4.0
+```
+
+`structure.py` imports it lazily, so dense-only usage (`kind="dense"`) and
+the diagonal/circulant kinds never touch it.
+
+### From source (development)
 
 ```bash
 uv sync
-uv pip install -e ".[dev]"   # optional: tests, mypy, ruff
+uv pip install -e ".[dev]"   # tests, mypy, ruff
 pytest -q
-```
-
-For structured-matrix support, also install
-[`torch-structured`](https://github.com/LarocheC/torch-structured):
-
-```bash
-uv pip install git+https://github.com/LarocheC/torch-structured
 ```
 
 ### Dense QAT layer
@@ -147,8 +162,10 @@ paths are feature-complete:
 | Triton persistent kernel for Monarch (fp32 + QAT) | ✓ |
 | Triton persistent kernel for Butterfly (fp32 + QAT) | ✓ |
 
-117 tests pass, 1 skipped (the simulator-parity placeholder that's
-deferred until the simulator is on `PYTHONPATH`).
+The suite spans parity, QAT, calibration, structured-matrix, and
+per-kernel strict numerical tests (CUDA-only Triton tests skip
+automatically when no GPU is present). Run `pytest -q` for the full set,
+or `pytest -m "not slow"` to skip the long-T parity sweeps.
 
 ## Train-step speed at `(T=64, B=32, H=512)` — fp32
 
